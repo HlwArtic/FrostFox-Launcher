@@ -14,17 +14,6 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      # Optional upstream renderer library. Not fatal if it is missing.
-      - name: Get LTW (optional)
-        uses: dawidd6/action-download-artifact@v6
-        continue-on-error: true
-        with:
-          repo: MojoLauncher/LTW
-          workflow: android.yml
-          workflow_conclusion: success
-          name: output-aar
-          path: app_mojo/libs
-
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
@@ -35,9 +24,10 @@ jobs:
         with:
           gradle-version: "8.14.5"
 
-      # FrostFox strip step 1: arm64 only, no Vulkan shader libraries.
-      # Fails loudly if an anchor is not found, so nothing is silently skipped.
-      - name: Apply FrostFox strip step 1
+      # FrostFox strip steps 1 and 2. Fails loudly if an anchor is not found.
+      #  step 1: arm64 only, no Vulkan shader libraries, no other-CPU JRE packages
+      #  step 2: no LTW renderer (step does not download it), English-only resources
+      - name: Apply FrostFox strip steps
         run: |
           rm -f app_mojo/libs/shaderc.aar app_mojo/libs/spvc.aar
           python3 - <<'PYEOF'
@@ -45,7 +35,7 @@ jobs:
           s = open(p).read()
           needle = "        minSdkVersion 21\n"
           assert s.count(needle) == 1, "minSdkVersion anchor not found"
-          s = s.replace(needle, needle + "        ndk { abiFilters 'arm64-v8a' }\n")
+          s = s.replace(needle, needle + "        ndk { abiFilters 'arm64-v8a' }\n        resConfigs 'en'\n")
           s += """
 
           // FrostFox step 1: other-CPU JRE packages are not needed in an arm64-only APK
@@ -64,34 +54,49 @@ jobs:
           }
           """
           open(p, 'w').write(s)
-          print("step 1 applied")
+          print("strip steps applied")
           PYEOF
 
       - name: Build debug APK
         run: gradle :app_mojo:assembleFullDebug --stacktrace
 
-      - name: Report APK size
+      # R8-shrunk build (closest to a release build). Optional: failure here does not fail the run.
+      - name: Build shrunk (R8) APK
+        id: shrunk
+        continue-on-error: true
+        run: gradle :app_mojo:assembleFullProguardNoDebug --stacktrace
+
+      - name: Report APK sizes
         run: |
-          APK=$(ls app_mojo/build/outputs/apk/full/debug/*.apk | head -1)
           mkdir -p out
-          cp "$APK" out/frostfox-step1-debug.apk
-          {
-            echo "### Step 1 APK size (baseline was 71M)"
+          report() {
+            local APK="$1" TITLE="$2"
+            echo "### $TITLE"
             echo "Total file size: $(du -h "$APK" | cut -f1)"
             echo
-            echo "Uncompressed totals per folder:"
-            for p in "lib/arm64-v8a" "lib/armeabi-v7a" "lib/x86" "lib/x86_64" "assets" "res" "classes"; do
+            for p in "lib/arm64-v8a" "assets" "res" "classes"; do
               echo "- $p: $(unzip -l "$APK" "$p*" 2>/dev/null | tail -1 | awk '{print $1}') bytes"
             done
             echo
-            echo "15 largest entries (bytes, name):"
+            echo "10 largest entries (bytes, name):"
             echo '```'
-            unzip -l "$APK" | awk 'NR>3 && NF>=4 {print $1, $4}' | sort -n -r | head -15
+            unzip -l "$APK" | awk 'NR>3 && NF>=4 {print $1, $4}' | sort -n -r | head -10
             echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          }
+          DEBUG=$(ls app_mojo/build/outputs/apk/full/debug/*.apk | head -1)
+          cp "$DEBUG" out/frostfox-step2-debug.apk
+          { report "$DEBUG" "Step 2 debug APK (step 1 was 27M, original 71M)"; } >> "$GITHUB_STEP_SUMMARY"
+          SHRUNK=$(ls app_mojo/build/outputs/apk/full/proguardNoDebug/*.apk 2>/dev/null | head -1 || true)
+          if [ -n "$SHRUNK" ]; then
+            cp "$SHRUNK" out/frostfox-step2-shrunk.apk
+            { report "$SHRUNK" "Step 2 shrunk (R8) APK"; } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### Shrunk (R8) APK was not built (see the build step log)" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
-      - name: Upload APK
+      - name: Upload APKs
         uses: actions/upload-artifact@v4
         with:
-          name: frostfox-step1-debug
-          path: out/frostfox-step1-debug.apk
+          name: frostfox-step2
+          path: out/*.apk
+
