@@ -1,0 +1,47 @@
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/fragments/SelectAuthFragment.java b/app_mojo/src/main/java/git/artdeell/mojo/fragments/SelectAuthFragment.java
+index f81db41..160893e 100644
+--- a/app_mojo/src/main/java/git/artdeell/mojo/fragments/SelectAuthFragment.java
++++ b/app_mojo/src/main/java/git/artdeell/mojo/fragments/SelectAuthFragment.java
+@@ -26,11 +26,9 @@ public class SelectAuthFragment extends Fragment {
+     public void onViewCreated(@NonNull View view, @Nullable Bundle savedInstanceState) {
+         Button mMicrosoftButton = view.findViewById(R.id.button_microsoft_authentication);
+         Button mLocalButton = view.findViewById(R.id.button_local_authentication);
+-        Button mElyByButton = view.findViewById(R.id.button_elyby_authentication);
+ 
+         mMicrosoftButton.setOnClickListener(v -> launchAuthFragment(MicrosoftLoginFragment.class, MicrosoftLoginFragment.TAG));
+         mLocalButton.setOnClickListener(v -> launchAuthFragment(LocalLoginFragment.class, LocalLoginFragment.TAG));
+-        mElyByButton.setOnClickListener(v -> launchAuthFragment(ElyByLoginFragment.class, ElyByLoginFragment.TAG));
+     }
+ 
+     private void launchAuthFragment(Class<? extends  Fragment> fragmentClass, String fragmentTag) {
+diff --git a/app_mojo/src/main/res/layout/fragment_select_auth_method.xml b/app_mojo/src/main/res/layout/fragment_select_auth_method.xml
+index 2544bf7..3c8688d 100644
+--- a/app_mojo/src/main/res/layout/fragment_select_auth_method.xml
++++ b/app_mojo/src/main/res/layout/fragment_select_auth_method.xml
+@@ -26,16 +26,6 @@
+             app:layout_constraintTop_toTopOf="parent"
+             />
+ 
+-        <com.kdt.mcgui.MineButton
+-            android:id="@+id/button_elyby_authentication"
+-            android:layout_width="match_parent"
+-            android:layout_height="wrap_content"
+-            android:text="@string/auth_select_elyby"
+-            android:textSize="@dimen/_12ssp"
+-            android:layout_marginHorizontal="@dimen/_25sdp"
+-            android:layout_marginTop="@dimen/_20sdp"
+-            app:layout_constraintTop_toBottomOf="@+id/button_microsoft_authentication" />
+-
+         <com.kdt.mcgui.MineButton
+             android:id="@+id/button_local_authentication"
+             android:layout_width="match_parent"
+@@ -44,7 +34,7 @@
+             android:textSize="@dimen/_12ssp"
+             android:layout_marginHorizontal="@dimen/_25sdp"
+             android:layout_marginTop="@dimen/_20sdp"
+-            app:layout_constraintTop_toBottomOf="@+id/button_elyby_authentication" />
++            app:layout_constraintTop_toBottomOf="@+id/button_microsoft_authentication" />
+ 
+     </androidx.constraintlayout.widget.ConstraintLayout>
+ </FrameLayout>
+\ No newline at end of file
