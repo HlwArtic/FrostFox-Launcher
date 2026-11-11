@@ -1,0 +1,281 @@
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/fragments/PerformanceFragment.java b/app_mojo/src/main/java/git/artdeell/mojo/fragments/PerformanceFragment.java
+index 68301b5..647b702 100644
+--- a/app_mojo/src/main/java/git/artdeell/mojo/fragments/PerformanceFragment.java
++++ b/app_mojo/src/main/java/git/artdeell/mojo/fragments/PerformanceFragment.java
+@@ -14,10 +14,12 @@ import android.widget.Toast;
+ 
+ import androidx.annotation.NonNull;
+ import androidx.annotation.Nullable;
++import androidx.appcompat.widget.SwitchCompat;
+ import androidx.fragment.app.Fragment;
+ 
+ import git.artdeell.mojo.MojoApplication;
+ import git.artdeell.mojo.Tools;
++import git.artdeell.mojo.game.ThermalGovernor;
+ import git.artdeell.mojo.instances.Instance;
+ import git.artdeell.mojo.instances.Instances;
+ import git.artdeell.mojo.prefs.LauncherPreferences;
+@@ -116,6 +118,21 @@ public class PerformanceFragment extends Fragment {
+         root.addView(mStatus);
+         updateStatus();
+ 
++        SwitchCompat thermalSwitch = new SwitchCompat(requireContext());
++        thermalSwitch.setText("Auto-lower quality when the phone gets hot");
++        thermalSwitch.setChecked(LauncherPreferences.DEFAULT_PREF.getBoolean(ThermalGovernor.PREF_KEY, true));
++        thermalSwitch.setOnCheckedChangeListener((button, checked) ->
++                LauncherPreferences.DEFAULT_PREF.edit().putBoolean(ThermalGovernor.PREF_KEY, checked).apply());
++        root.addView(thermalSwitch);
++
++        TextView thermalHint = new TextView(requireContext());
++        thermalHint.setText("In game, the resolution steps down when the phone heats up and comes back "
++                + "slowly once it cools. Your saved settings are never changed.");
++        thermalHint.setAlpha(0.7f);
++        thermalHint.setTextSize(12);
++        thermalHint.setPadding(0, 0, 0, gap * 2);
++        root.addView(thermalHint);
++
+         for (Preset preset : PRESETS) {
+             Button button = new Button(requireContext());
+             button.setAllCaps(false);
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/game/GameActivity.java b/app_mojo/src/main/java/git/artdeell/mojo/game/GameActivity.java
+index 246fd00..71a2e0e 100644
+--- a/app_mojo/src/main/java/git/artdeell/mojo/game/GameActivity.java
++++ b/app_mojo/src/main/java/git/artdeell/mojo/game/GameActivity.java
+@@ -99,6 +99,7 @@ public class GameActivity extends BaseActivity implements ControlButtonMenuListe
+     private HotbarView mHotbarView;
+     private View mLoadingScreen;
+     private GameRenderer mGameRenderer;
++    private ThermalGovernor mThermalGovernor;
+ 
+     Instance instance;
+     Account account;
+@@ -331,6 +332,13 @@ public class GameActivity extends BaseActivity implements ControlButtonMenuListe
+         ContextExecutor.setActivity(this);
+         if(PREF_ENABLE_GYRO) mGyroControl.enable();
+         PLATFORM.setHovered(true);
++        if(mThermalGovernor == null) {
++            mThermalGovernor = new ThermalGovernor(this, scale -> {
++                launcherGLView.refreshSize();
++                mHotbarView.onResolutionChanged();
++            });
++        }
++        mThermalGovernor.start();
+     }
+ 
+     @Override
+@@ -345,6 +353,7 @@ public class GameActivity extends BaseActivity implements ControlButtonMenuListe
+             mQuickSettingSideDialog.cancel();
+         }
+         PLATFORM.setHovered(false);
++        if(mThermalGovernor != null) mThermalGovernor.stop();
+         super.onPause();
+     }
+ 
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/game/ThermalGovernor.java b/app_mojo/src/main/java/git/artdeell/mojo/game/ThermalGovernor.java
+new file mode 100644
+index 0000000..cb4a789
+--- /dev/null
++++ b/app_mojo/src/main/java/git/artdeell/mojo/game/ThermalGovernor.java
+@@ -0,0 +1,202 @@
++package git.artdeell.mojo.game;
++
++import android.app.Activity;
++import android.content.Context;
++import android.content.Intent;
++import android.content.IntentFilter;
++import android.os.BatteryManager;
++import android.os.Build;
++import android.os.PowerManager;
++import android.os.SystemClock;
++import android.util.Log;
++import android.widget.Toast;
++
++import androidx.annotation.RequiresApi;
++
++import git.artdeell.mojo.Tools;
++import git.artdeell.mojo.prefs.LauncherPreferences;
++
++/**
++ * FrostFox: keeps long sessions cool. While the game is in the foreground it watches the phone's
++ * heat (Android thermal status on Android 10+, battery temperature on every version) and steps
++ * the resolution scale down when the phone is hot, then back up slowly once it has cooled.
++ * It never writes the user's saved settings. It can be turned off in the Performance screen.
++ */
++public final class ThermalGovernor {
++    public static final String PREF_KEY = "frostfoxThermal";
++
++    public interface Listener {
++        /** Called on the main thread after LauncherPreferences.PREF_SCALE_FACTOR was changed. */
++        void onScaleChanged(float scale);
++    }
++
++    private static final String TAG = "FrostFoxThermal";
++    private static final long CHECK_MS = 10_000L;
++    private static final long DOWN_COOLDOWN_MS = 20_000L;
++    private static final long UP_COOLDOWN_MS = 90_000L;
++    private static final float STEP = 0.10f;
++    private static final float MIN_SCALE = 0.40f;
++
++    // Battery temperature thresholds in degrees Celsius
++    private static final float TEMP_WARM = 41f;
++    private static final float TEMP_HOT = 44f;
++    private static final float TEMP_VERY_HOT = 47f;
++
++    private final Activity mActivity;
++    private final Listener mListener;
++    private final Runnable mTick = this::tick;
++
++    private boolean mRunning;
++    private int mThermalStatus; // Android 10+ only; 0 = none
++    private Api29 mApi29;
++    private float mUserScale;
++    private float mAppliedScale;
++    private long mLastDown;
++    private long mLastUp;
++    private long mCoolSince = -1;
++
++    public ThermalGovernor(Activity activity, Listener listener) {
++        mActivity = activity;
++        mListener = listener;
++    }
++
++    public void start() {
++        if (mRunning) return;
++        if (!LauncherPreferences.DEFAULT_PREF.getBoolean(PREF_KEY, true)) return;
++        mRunning = true;
++        mUserScale = LauncherPreferences.PREF_SCALE_FACTOR;
++        mAppliedScale = mUserScale;
++        mLastDown = 0;
++        mLastUp = SystemClock.elapsedRealtime();
++        mCoolSince = -1;
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
++            try {
++                mApi29 = new Api29(this, mActivity);
++                mApi29.register();
++            } catch (Throwable t) {
++                Log.w(TAG, "Thermal status not available: " + t);
++                mApi29 = null;
++            }
++        }
++        Tools.MAIN_HANDLER.post(mTick);
++    }
++
++    public void stop() {
++        if (!mRunning) return;
++        mRunning = false;
++        Tools.MAIN_HANDLER.removeCallbacks(mTick);
++        if (mApi29 != null) {
++            try {
++                mApi29.unregister();
++            } catch (Throwable ignored) {
++            }
++            mApi29 = null;
++        }
++        // Hand the user's own scale back so nothing we did lingers
++        LauncherPreferences.PREF_SCALE_FACTOR = mUserScale;
++    }
++
++    private void onStatus(int status) {
++        mThermalStatus = status;
++        if (!mRunning) return;
++        Tools.MAIN_HANDLER.removeCallbacks(mTick);
++        Tools.MAIN_HANDLER.post(mTick);
++    }
++
++    /** 0 cool, 1 warm (hold), 2 hot (step down), 3 very hot (step down faster). */
++    private int heatLevel() {
++        int level = 0;
++        // Android thermal status: 1 light, 2 moderate, 3 severe or worse
++        if (mThermalStatus >= 3) level = 3;
++        else if (mThermalStatus == 2) level = 2;
++        else if (mThermalStatus == 1) level = 1;
++
++        float temp = batteryTemperature();
++        if (temp >= TEMP_VERY_HOT) level = Math.max(level, 3);
++        else if (temp >= TEMP_HOT) level = Math.max(level, 2);
++        else if (temp >= TEMP_WARM) level = Math.max(level, 1);
++        return level;
++    }
++
++    private float batteryTemperature() {
++        try {
++            Intent intent = mActivity.registerReceiver(null,
++                    new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
++            if (intent == null) return 0f;
++            int tenths = intent.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0);
++            return tenths / 10f;
++        } catch (Throwable t) {
++            return 0f;
++        }
++    }
++
++    private void tick() {
++        if (!mRunning) return;
++        // The user changed the resolution by hand (in-game quick settings): that is the new ceiling
++        float current = LauncherPreferences.PREF_SCALE_FACTOR;
++        if (Math.abs(current - mAppliedScale) > 0.001f) {
++            mUserScale = current;
++            mAppliedScale = current;
++        }
++
++        int level = heatLevel();
++        long now = SystemClock.elapsedRealtime();
++        if (level == 0) {
++            if (mCoolSince < 0) mCoolSince = now;
++        } else {
++            mCoolSince = -1;
++        }
++
++        if (level >= 2 && now - mLastDown >= DOWN_COOLDOWN_MS) {
++            float floor = Math.min(MIN_SCALE, mUserScale);
++            float target = Math.max(floor, mAppliedScale - STEP * (level >= 3 ? 2 : 1));
++            if (target < mAppliedScale - 0.001f) {
++                mLastDown = now;
++                apply(target, "Phone is hot: resolution lowered to ");
++            }
++        } else if (level == 0 && mAppliedScale < mUserScale - 0.001f
++                && mCoolSince >= 0 && now - mCoolSince >= UP_COOLDOWN_MS
++                && now - mLastUp >= UP_COOLDOWN_MS) {
++            float target = Math.min(mUserScale, mAppliedScale + STEP);
++            mLastUp = now;
++            apply(target, "Phone has cooled: resolution restored to ");
++        }
++
++        Tools.MAIN_HANDLER.postDelayed(mTick, CHECK_MS);
++    }
++
++    private void apply(float scale, String message) {
++        scale = Math.round(scale * 100f) / 100f;
++        mAppliedScale = scale;
++        LauncherPreferences.PREF_SCALE_FACTOR = scale;
++        Log.i(TAG, message + Math.round(scale * 100f) + "%");
++        mListener.onScaleChanged(scale);
++        Toast.makeText(mActivity, message + Math.round(scale * 100f) + "%", Toast.LENGTH_SHORT).show();
++    }
++
++    /** Wrapper so that Android 10+ classes are only touched on Android 10+. */
++    @RequiresApi(Build.VERSION_CODES.Q)
++    private static final class Api29 implements PowerManager.OnThermalStatusChangedListener {
++        private final ThermalGovernor mOwner;
++        private final PowerManager mPowerManager;
++
++        Api29(ThermalGovernor owner, Activity activity) {
++            mOwner = owner;
++            mPowerManager = (PowerManager) activity.getSystemService(Context.POWER_SERVICE);
++        }
++
++        void register() {
++            mOwner.mThermalStatus = mPowerManager.getCurrentThermalStatus();
++            mPowerManager.addThermalStatusListener(this);
++        }
++
++        void unregister() {
++            mPowerManager.removeThermalStatusListener(this);
++        }
++
++        @Override
++        public void onThermalStatusChanged(int status) {
++            mOwner.onStatus(status);
++        }
++    }
++}
