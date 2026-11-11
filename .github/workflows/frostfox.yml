@@ -24,10 +24,9 @@ jobs:
         with:
           gradle-version: "8.14.5"
 
-      # FrostFox strip steps 1 and 2. Fails loudly if an anchor is not found.
-      #  step 1: arm64 only, no Vulkan shader libraries, no other-CPU JRE packages
-      #  step 2: no LTW renderer (step does not download it), English-only resources
-      - name: Apply FrostFox strip steps
+      # Build-file strip steps: arm64 only, no Vulkan shader libraries,
+      # no LTW renderer, English-only resources, no other-CPU JRE packages.
+      - name: Apply FrostFox build strip steps
         run: |
           rm -f app_mojo/libs/shaderc.aar app_mojo/libs/spvc.aar
           python3 - <<'PYEOF'
@@ -38,7 +37,7 @@ jobs:
           s = s.replace(needle, needle + "        ndk { abiFilters 'arm64-v8a' }\n        resConfigs 'en'\n")
           s += """
 
-          // FrostFox step 1: other-CPU JRE packages are not needed in an arm64-only APK
+          // FrostFox: other-CPU JRE packages are not needed in an arm64-only APK
           tasks.matching { it.name.startsWith('merge') && it.name.endsWith('Assets') }.configureEach { t ->
               t.doLast {
                   try {
@@ -54,49 +53,43 @@ jobs:
           }
           """
           open(p, 'w').write(s)
-          print("strip steps applied")
+          print("build strip steps applied")
           PYEOF
+
+      # Source patches live in the repo's patches/ folder and are applied in name order.
+      # Fails loudly if a patch no longer applies.
+      - name: Apply FrostFox source patches
+        run: |
+          shopt -s nullglob
+          for p in patches/*.patch; do
+            echo "Applying $p"
+            git apply --verbose "$p"
+          done
 
       - name: Build debug APK
         run: gradle :app_mojo:assembleFullDebug --stacktrace
 
-      # R8-shrunk build (closest to a release build). Optional: failure here does not fail the run.
-      - name: Build shrunk (R8) APK
-        id: shrunk
-        continue-on-error: true
-        run: gradle :app_mojo:assembleFullProguardNoDebug --stacktrace
-
-      - name: Report APK sizes
+      - name: Report APK size
         run: |
+          APK=$(ls app_mojo/build/outputs/apk/full/debug/*.apk | head -1)
           mkdir -p out
-          report() {
-            local APK="$1" TITLE="$2"
-            echo "### $TITLE"
+          cp "$APK" out/frostfox-debug.apk
+          {
+            echo "### FrostFox debug APK"
             echo "Total file size: $(du -h "$APK" | cut -f1)"
             echo
             for p in "lib/arm64-v8a" "assets" "res" "classes"; do
               echo "- $p: $(unzip -l "$APK" "$p*" 2>/dev/null | tail -1 | awk '{print $1}') bytes"
             done
             echo
-            echo "10 largest entries (bytes, name):"
+            echo "Patches applied:"
             echo '```'
-            unzip -l "$APK" | awk 'NR>3 && NF>=4 {print $1, $4}' | sort -n -r | head -10
+            ls patches 2>/dev/null || echo "(none)"
             echo '```'
-          }
-          DEBUG=$(ls app_mojo/build/outputs/apk/full/debug/*.apk | head -1)
-          cp "$DEBUG" out/frostfox-step2-debug.apk
-          { report "$DEBUG" "Step 2 debug APK (step 1 was 27M, original 71M)"; } >> "$GITHUB_STEP_SUMMARY"
-          SHRUNK=$(ls app_mojo/build/outputs/apk/full/proguardNoDebug/*.apk 2>/dev/null | head -1 || true)
-          if [ -n "$SHRUNK" ]; then
-            cp "$SHRUNK" out/frostfox-step2-shrunk.apk
-            { report "$SHRUNK" "Step 2 shrunk (R8) APK"; } >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "### Shrunk (R8) APK was not built (see the build step log)" >> "$GITHUB_STEP_SUMMARY"
-          fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload APKs
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: frostfox-step2
-          path: out/*.apk
-
+          name: frostfox-debug
+          path: out/frostfox-debug.apk
