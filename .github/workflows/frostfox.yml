@@ -35,6 +35,38 @@ jobs:
         with:
           gradle-version: "8.14.5"
 
+      # FrostFox strip step 1: arm64 only, no Vulkan shader libraries.
+      # Fails loudly if an anchor is not found, so nothing is silently skipped.
+      - name: Apply FrostFox strip step 1
+        run: |
+          rm -f app_mojo/libs/shaderc.aar app_mojo/libs/spvc.aar
+          python3 - <<'PYEOF'
+          p = 'app_mojo/build.gradle'
+          s = open(p).read()
+          needle = "        minSdkVersion 21\n"
+          assert s.count(needle) == 1, "minSdkVersion anchor not found"
+          s = s.replace(needle, needle + "        ndk { abiFilters 'arm64-v8a' }\n")
+          s += """
+
+          // FrostFox step 1: other-CPU JRE packages are not needed in an arm64-only APK
+          tasks.matching { it.name.startsWith('merge') && it.name.endsWith('Assets') }.configureEach { t ->
+              t.doLast {
+                  try {
+                      def out = t.outputDir.get().asFile
+                      ['bin-arm.tar.xz', 'bin-x86.tar.xz', 'bin-x86_64.tar.xz'].each {
+                          def f = new File(out, 'components/jre/' + it)
+                          if (f.exists()) { f.delete(); println 'FrostFox: removed ' + f.name }
+                      }
+                  } catch (Throwable e) {
+                      println 'FrostFox: asset cleanup skipped: ' + e
+                  }
+              }
+          }
+          """
+          open(p, 'w').write(s)
+          print("step 1 applied")
+          PYEOF
+
       - name: Build debug APK
         run: gradle :app_mojo:assembleFullDebug --stacktrace
 
@@ -42,9 +74,9 @@ jobs:
         run: |
           APK=$(ls app_mojo/build/outputs/apk/full/debug/*.apk | head -1)
           mkdir -p out
-          cp "$APK" out/frostfox-baseline-debug.apk
+          cp "$APK" out/frostfox-step1-debug.apk
           {
-            echo "### Baseline APK size"
+            echo "### Step 1 APK size (baseline was 71M)"
             echo "Total file size: $(du -h "$APK" | cut -f1)"
             echo
             echo "Uncompressed totals per folder:"
@@ -61,5 +93,5 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: frostfox-baseline-debug
-          path: out/frostfox-baseline-debug.apk
+          name: frostfox-step1-debug
+          path: out/frostfox-step1-debug.apk
