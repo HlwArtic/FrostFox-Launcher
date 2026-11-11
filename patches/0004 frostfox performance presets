@@ -1,0 +1,229 @@
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/fragments/MainMenuFragment.java b/app_mojo/src/main/java/git/artdeell/mojo/fragments/MainMenuFragment.java
+index 278e754..dec36f3 100644
+--- a/app_mojo/src/main/java/git/artdeell/mojo/fragments/MainMenuFragment.java
++++ b/app_mojo/src/main/java/git/artdeell/mojo/fragments/MainMenuFragment.java
+@@ -59,7 +59,9 @@ public class MainMenuFragment extends Fragment {
+         Button mPlayButton = view.findViewById(R.id.play_button);
+         mVersionSpinner = view.findViewById(R.id.mc_version_spinner);
+ 
+-        mNewsButton.setOnClickListener(v -> Tools.openURL(requireActivity(), Tools.URL_HOME));
++        // FrostFox: this slot opens the performance presets instead of the news page
++        mNewsButton.setText("Performance");
++        mNewsButton.setOnClickListener(v -> Tools.swapFragment(requireActivity(), PerformanceFragment.class, PerformanceFragment.TAG, null));
+         mDiscordButton.setOnClickListener(v -> Tools.openURL(requireActivity(), getString(R.string.social_media_invite)));
+         mCustomControlButton.setOnClickListener(v -> startActivity(new Intent(requireContext(), CustomControlsActivity.class)));
+         // FrostFox: this slot opens the Mods screen instead of running a .jar installer
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/fragments/PerformanceFragment.java b/app_mojo/src/main/java/git/artdeell/mojo/fragments/PerformanceFragment.java
+new file mode 100644
+index 0000000..68301b5
+--- /dev/null
++++ b/app_mojo/src/main/java/git/artdeell/mojo/fragments/PerformanceFragment.java
+@@ -0,0 +1,208 @@
++package git.artdeell.mojo.fragments;
++
++import android.content.SharedPreferences;
++import android.graphics.Typeface;
++import android.os.Bundle;
++import android.view.LayoutInflater;
++import android.view.View;
++import android.view.ViewGroup;
++import android.widget.Button;
++import android.widget.LinearLayout;
++import android.widget.ScrollView;
++import android.widget.TextView;
++import android.widget.Toast;
++
++import androidx.annotation.NonNull;
++import androidx.annotation.Nullable;
++import androidx.fragment.app.Fragment;
++
++import git.artdeell.mojo.MojoApplication;
++import git.artdeell.mojo.Tools;
++import git.artdeell.mojo.instances.Instance;
++import git.artdeell.mojo.instances.Instances;
++import git.artdeell.mojo.prefs.LauncherPreferences;
++
++import java.io.BufferedReader;
++import java.io.BufferedWriter;
++import java.io.File;
++import java.io.FileInputStream;
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.io.InputStreamReader;
++import java.io.OutputStreamWriter;
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++
++/**
++ * FrostFox: one-tap performance presets. A preset sets the launcher's resolution scale and
++ * sustained-performance mode, and writes the matching video options into the selected
++ * instance's options.txt. A preset is applied only when tapped, so later in-game changes stick.
++ */
++public class PerformanceFragment extends Fragment {
++    public static final String TAG = "PerformanceFragment";
++    private static final String PREF_LAST_PRESET = "frostfoxPreset";
++
++    private static class Preset {
++        final String name;
++        final String description;
++        final int resolutionPercent;
++        final boolean sustained;
++        final Map<String, String> options = new LinkedHashMap<>();
++
++        Preset(String name, String description, int resolutionPercent, boolean sustained,
++               int renderDistance, int maxFps, int particles, int mipmaps) {
++            this.name = name;
++            this.description = description;
++            this.resolutionPercent = resolutionPercent;
++            this.sustained = sustained;
++            options.put("renderDistance", String.valueOf(renderDistance));
++            options.put("maxFps", String.valueOf(maxFps));
++            options.put("fancyGraphics", "false");
++            options.put("ao", "0");
++            options.put("particles", String.valueOf(particles));
++            options.put("clouds", "false");
++            options.put("ofClouds", "3");
++            options.put("entityShadows", "false");
++            options.put("mipmapLevels", String.valueOf(mipmaps));
++            options.put("enableVsync", "false");
++        }
++    }
++
++    private static final Preset[] PRESETS = {
++            new Preset("Battery saver",
++                    "Coolest and longest play time. Resolution 50%, 3 chunks, 30 FPS cap.",
++                    50, true, 3, 30, 2, 0),
++            new Preset("Balanced",
++                    "Recommended. Resolution 70%, 4 chunks, 60 FPS cap, steady clocks.",
++                    70, true, 4, 60, 2, 0),
++            new Preset("Performance",
++                    "Sharper and smoother, but warmer. Resolution 85%, 6 chunks, 120 FPS cap.",
++                    85, false, 6, 120, 1, 2),
++    };
++
++    private TextView mStatus;
++
++    @Nullable
++    @Override
++    public View onCreateView(@NonNull LayoutInflater inflater, @Nullable ViewGroup container,
++                             @Nullable Bundle savedInstanceState) {
++        int pad = (int) Tools.dpToPx(16);
++        int gap = (int) Tools.dpToPx(12);
++
++        ScrollView scroll = new ScrollView(requireContext());
++        LinearLayout root = new LinearLayout(requireContext());
++        root.setOrientation(LinearLayout.VERTICAL);
++        root.setPadding(pad, pad, pad, pad);
++        scroll.addView(root);
++
++        TextView title = new TextView(requireContext());
++        title.setText("Performance");
++        title.setTextSize(22);
++        title.setTypeface(Typeface.DEFAULT_BOLD);
++        root.addView(title);
++
++        TextView intro = new TextView(requireContext());
++        intro.setText("Pick a preset for the selected instance. It sets the resolution scale and the "
++                + "game's video options (render distance, FPS cap, particles, clouds, shadows). "
++                + "You can still change any setting afterwards; a preset only applies when you tap it.");
++        intro.setAlpha(0.7f);
++        intro.setPadding(0, 0, 0, gap);
++        root.addView(intro);
++
++        mStatus = new TextView(requireContext());
++        mStatus.setPadding(0, 0, 0, gap);
++        root.addView(mStatus);
++        updateStatus();
++
++        for (Preset preset : PRESETS) {
++            Button button = new Button(requireContext());
++            button.setAllCaps(false);
++            button.setText(preset.name);
++            button.setOnClickListener(v -> apply(preset));
++            root.addView(button);
++
++            TextView description = new TextView(requireContext());
++            description.setText(preset.description);
++            description.setAlpha(0.7f);
++            description.setTextSize(12);
++            description.setPadding(0, 0, 0, gap);
++            root.addView(description);
++        }
++        return scroll;
++    }
++
++    private void updateStatus() {
++        String last = LauncherPreferences.DEFAULT_PREF.getString(PREF_LAST_PRESET, null);
++        mStatus.setText(last == null ? "No preset applied yet." : "Last applied: " + last);
++    }
++
++    private void apply(Preset preset) {
++        Instance instance = Instances.loadSelectedInstance();
++        if (instance == null) {
++            Toast.makeText(requireContext(), "No instance selected", Toast.LENGTH_LONG).show();
++            return;
++        }
++        final File optionsFile = new File(instance.getGameDirectory(), "options.txt");
++
++        SharedPreferences.Editor editor = LauncherPreferences.DEFAULT_PREF.edit();
++        editor.putInt("resolutionRatio", preset.resolutionPercent);
++        editor.putBoolean("sustainedPerformance", preset.sustained);
++        editor.putString(PREF_LAST_PRESET, preset.name);
++        editor.apply();
++        LauncherPreferences.PREF_SCALE_FACTOR = preset.resolutionPercent / 100f;
++
++        MojoApplication.sExecutorService.execute(() -> {
++            String message;
++            try {
++                mergeOptions(optionsFile, preset.options);
++                message = preset.name + " applied";
++            } catch (IOException e) {
++                message = "Could not write options.txt: " + e.getMessage();
++            }
++            final String toast = message;
++            Tools.runOnUiThread(() -> {
++                if (!isAdded()) return;
++                Toast.makeText(requireContext(), toast, Toast.LENGTH_LONG).show();
++                updateStatus();
++            });
++        });
++    }
++
++    /** Sets the given keys in options.txt and keeps every other line as it was. */
++    private static void mergeOptions(File file, Map<String, String> values) throws IOException {
++        List<String> lines = new ArrayList<>();
++        if (file.exists()) {
++            try (BufferedReader reader = new BufferedReader(
++                    new InputStreamReader(new FileInputStream(file), "UTF-8"))) {
++                String line;
++                while ((line = reader.readLine()) != null) lines.add(line);
++            }
++        }
++        Map<String, String> remaining = new LinkedHashMap<>(values);
++        for (int i = 0; i < lines.size(); i++) {
++            String line = lines.get(i);
++            int colon = line.indexOf(':');
++            if (colon <= 0) continue;
++            String key = line.substring(0, colon);
++            if (remaining.containsKey(key)) {
++                lines.set(i, key + ":" + remaining.remove(key));
++            }
++        }
++        for (Map.Entry<String, String> entry : remaining.entrySet()) {
++            lines.add(entry.getKey() + ":" + entry.getValue());
++        }
++        File parent = file.getParentFile();
++        if (parent != null && !parent.exists() && !parent.mkdirs()) {
++            throw new IOException("Cannot create " + parent);
++        }
++        try (BufferedWriter writer = new BufferedWriter(
++                new OutputStreamWriter(new FileOutputStream(file), "UTF-8"))) {
++            for (String line : lines) {
++                writer.write(line);
++                writer.write('\n');
++            }
++        }
++    }
++}
