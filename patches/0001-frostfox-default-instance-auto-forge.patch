@@ -1,0 +1,174 @@
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/LauncherActivity.java b/app_mojo/src/main/java/git/artdeell/mojo/LauncherActivity.java
+index 0db5294..747f465 100644
+--- a/app_mojo/src/main/java/git/artdeell/mojo/LauncherActivity.java
++++ b/app_mojo/src/main/java/git/artdeell/mojo/LauncherActivity.java
+@@ -32,6 +32,7 @@ import git.artdeell.mojo.extra.ExtraListener;
+ import git.artdeell.mojo.fragments.MainMenuFragment;
+ import git.artdeell.mojo.fragments.MicrosoftLoginFragment;
+ import git.artdeell.mojo.fragments.SelectAuthFragment;
++import git.artdeell.mojo.instances.ForgeAutoInstall;
+ import git.artdeell.mojo.instances.Instance;
+ import git.artdeell.mojo.instances.InstanceInstaller;
+ import git.artdeell.mojo.instances.Instances;
+@@ -109,6 +110,11 @@ public class LauncherActivity extends BaseActivity {
+             return false;
+         }
+ 
++        if(selectedInstance.installer == null && ForgeAutoInstall.needed(selectedInstance)) {
++            ForgeAutoInstall.install(selectedInstance);
++            return false;
++        }
++
+         if(selectedInstance.installer != null) {
+             selectedInstance.installer.start();
+             return false;
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/instances/ForgeAutoInstall.java b/app_mojo/src/main/java/git/artdeell/mojo/instances/ForgeAutoInstall.java
+new file mode 100644
+index 0000000..4d5c64c
+--- /dev/null
++++ b/app_mojo/src/main/java/git/artdeell/mojo/instances/ForgeAutoInstall.java
+@@ -0,0 +1,44 @@
++package git.artdeell.mojo.instances;
++
++import com.kdt.mcgui.ProgressLayout;
++
++import git.artdeell.mojo.MojoApplication;
++import git.artdeell.mojo.Tools;
++import git.artdeell.mojo.modding.forge.ForgelikeUtils;
++
++import java.util.Locale;
++
++/**
++ * FrostFox: installs Forge 1.8.9 automatically the first time an instance is played.
++ * Reuses the existing installer pipeline (download, SHA-1 check, auto-clicked installer),
++ * so the user does not have to open any Forge menu.
++ */
++public final class ForgeAutoInstall {
++    public static final String FORGE_VERSION = "1.8.9-11.15.1.2318-1.8.9";
++
++    private ForgeAutoInstall() {
++    }
++
++    /** True if this instance wants Forge but its version is not a Forge version yet. */
++    public static boolean needed(Instance instance) {
++        if(!instance.autoForge) return false;
++        String id = instance.versionId;
++        return id == null || !id.toLowerCase(Locale.ROOT).contains("forge");
++    }
++
++    /** Starts the Forge install in the background. The installer fills in versionId when done. */
++    public static void install(Instance instance) {
++        ProgressLayout.setProgress(ProgressLayout.INSTANCE_INSTALL, 0);
++        MojoApplication.sExecutorService.execute(() -> {
++            try {
++                InstanceInstaller installer = ForgelikeUtils.FORGE_UTILS.createInstaller(FORGE_VERSION);
++                instance.installer = installer;
++                instance.write();
++                installer.start();
++            } catch (Exception e) {
++                ProgressLayout.clearProgress(ProgressLayout.INSTANCE_INSTALL);
++                Tools.showErrorRemote(e);
++            }
++        });
++    }
++}
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/instances/Instance.java b/app_mojo/src/main/java/git/artdeell/mojo/instances/Instance.java
+index 4cb63c3..2c4b001 100644
+--- a/app_mojo/src/main/java/git/artdeell/mojo/instances/Instance.java
++++ b/app_mojo/src/main/java/git/artdeell/mojo/instances/Instance.java
+@@ -28,6 +28,8 @@ public class Instance extends DisplayInstance {
+     public String selectedRuntime;
+     public String controlLayout;
+     public boolean sharedData;
++    /** FrostFox: install Forge 1.8.9 automatically on first Play. */
++    public boolean autoForge;
+ 
+     protected Instance() {
+     }
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/instances/Instances.java b/app_mojo/src/main/java/git/artdeell/mojo/instances/Instances.java
+index b24ff73..1484c3a 100644
+--- a/app_mojo/src/main/java/git/artdeell/mojo/instances/Instances.java
++++ b/app_mojo/src/main/java/git/artdeell/mojo/instances/Instances.java
+@@ -141,9 +141,11 @@ public class Instances {
+      */
+     private static void createFirstTimeInstance() throws IOException {
+         internalCreateInstance((instance)-> {
+-            instance.sharedData = true;
+-            instance.versionId = "1.12.2";
+-        }, null);
++            instance.name = "Skyblock 1.8.9 Forge";
++            instance.sharedData = false;
++            instance.autoForge = true;
++            instance.versionId = "1.8.9";
++        }, "Skyblock-1.8.9-Forge");
+     }
+ 
+     /**
+@@ -152,8 +154,9 @@ public class Instances {
+      */
+     public static Instance createDefaultInstance() throws IOException {
+         return createInstance((instance)-> {
+-            instance.sharedData = true;
+-            instance.versionId = Instance.VERSION_LATEST_RELEASE;
++            instance.sharedData = false;
++            instance.autoForge = true;
++            instance.versionId = "1.8.9";
+         }, null);
+     }
+ 
+@@ -164,6 +167,7 @@ public class Instances {
+     private static Instance internalCreateInstance(InstanceSetter instanceSetter, String namePrefix) throws IOException{
+         File root = findNewInstanceRoot(namePrefix);
+         FileUtils.ensureDirectory(root);
++        FileUtils.ensureDirectory(new File(root, "mods"));
+         Instance instance = new Instance();
+         instance.mInstanceRoot = root;
+         instanceSetter.setInstanceProperties(instance);
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/prefs/LauncherPreferences.java b/app_mojo/src/main/java/git/artdeell/mojo/prefs/LauncherPreferences.java
+index 4c4c36b..3928207 100644
+--- a/app_mojo/src/main/java/git/artdeell/mojo/prefs/LauncherPreferences.java
++++ b/app_mojo/src/main/java/git/artdeell/mojo/prefs/LauncherPreferences.java
+@@ -90,7 +90,7 @@ public class LauncherPreferences {
+         PREF_BUTTONSIZE = DEFAULT_PREF.getInt("buttonscale", 100);
+         PREF_MOUSESCALE = DEFAULT_PREF.getInt("mousescale", 100)/100f;
+         PREF_MOUSESPEED = ((float)DEFAULT_PREF.getInt("mousespeed",100))/100f;
+-        PREF_IGNORE_NOTCH = DEFAULT_PREF.getBoolean("ignoreNotch", false);
++        PREF_IGNORE_NOTCH = DEFAULT_PREF.getBoolean("ignoreNotch", true);
+ 		PREF_LONGPRESS_TRIGGER = DEFAULT_PREF.getInt("timeLongPressTrigger", 300);
+ 		PREF_DEFAULTCTRL_PATH = DEFAULT_PREF.getString("defaultCtrl", Tools.CTRLDEF_FILE);
+         PREF_FORCE_ENGLISH = DEFAULT_PREF.getBoolean("force_english", false);
+@@ -114,7 +114,7 @@ public class LauncherPreferences {
+         PREF_BUTTON_ALL_CAPS = DEFAULT_PREF.getBoolean("buttonAllCaps", true);
+         PREF_DUMP_SHADERS = DEFAULT_PREF.getBoolean("dump_shaders", false);
+         PREF_DEADZONE_SCALE = ((float) DEFAULT_PREF.getInt("gamepad_deadzone_scale", 100))/100f;
+-        PREF_BIG_CORE_AFFINITY = DEFAULT_PREF.getBoolean("bigCoreAffinity", false);
++        PREF_BIG_CORE_AFFINITY = DEFAULT_PREF.getBoolean("bigCoreAffinity", true);
+         PREF_ZINK_PREFER_SYSTEM_DRIVER = DEFAULT_PREF.getBoolean("zinkPreferSystemDriver", !hasVulkanDrivers());
+         PREF_DOWNLOAD_SOURCE = DEFAULT_PREF.getString("downloadSource", "default");
+         PREF_VERIFY_MANIFEST = DEFAULT_PREF.getBoolean("verifyManifest", true);
+diff --git a/app_mojo/src/main/res/xml/pref_experimental.xml b/app_mojo/src/main/res/xml/pref_experimental.xml
+index b24eaed..d1bacfe 100644
+--- a/app_mojo/src/main/res/xml/pref_experimental.xml
++++ b/app_mojo/src/main/res/xml/pref_experimental.xml
+@@ -10,7 +10,7 @@
+             android:summary="@string/preference_shader_dump_description"
+             />
+         <SwitchPreferenceCompat
+-            android:defaultValue="false"
++            android:defaultValue="true"
+             android:key="bigCoreAffinity"
+             android:title="@string/preference_force_big_core_title"
+             android:summary="@string/preference_force_big_core_desc" />
+diff --git a/app_mojo/src/main/res/xml/pref_video.xml b/app_mojo/src/main/res/xml/pref_video.xml
+index d268e67..80b21d7 100644
+--- a/app_mojo/src/main/res/xml/pref_video.xml
++++ b/app_mojo/src/main/res/xml/pref_video.xml
+@@ -13,7 +13,7 @@
+             app2:useSimpleSummaryProvider="true"/>
+ 
+         <androidx.preference.SwitchPreferenceCompat
+-            android:defaultValue="false"
++            android:defaultValue="true"
+             android:key="ignoreNotch"
+             android:summary="@string/mcl_setting_subtitle_ignore_notch"
+             android:title="@string/mcl_setting_title_ignore_notch"
