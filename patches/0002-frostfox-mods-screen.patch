@@ -1,0 +1,397 @@
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/fragments/MainMenuFragment.java b/app_mojo/src/main/java/git/artdeell/mojo/fragments/MainMenuFragment.java
+index 1ffbc63..278e754 100644
+--- a/app_mojo/src/main/java/git/artdeell/mojo/fragments/MainMenuFragment.java
++++ b/app_mojo/src/main/java/git/artdeell/mojo/fragments/MainMenuFragment.java
+@@ -62,7 +62,9 @@ public class MainMenuFragment extends Fragment {
+         mNewsButton.setOnClickListener(v -> Tools.openURL(requireActivity(), Tools.URL_HOME));
+         mDiscordButton.setOnClickListener(v -> Tools.openURL(requireActivity(), getString(R.string.social_media_invite)));
+         mCustomControlButton.setOnClickListener(v -> startActivity(new Intent(requireContext(), CustomControlsActivity.class)));
+-        mInstallJarButton.setOnClickListener(v -> runInstallerWithConfirmation());
++        // FrostFox: this slot opens the Mods screen instead of running a .jar installer
++        mInstallJarButton.setText("Mods");
++        mInstallJarButton.setOnClickListener(v -> Tools.swapFragment(requireActivity(), ModsFragment.class, ModsFragment.TAG, null));
+         mEditProfileButton.setOnClickListener(v -> mVersionSpinner.openProfileEditor(requireActivity()));
+ 
+         mPlayButton.setOnClickListener(v -> ExtraCore.setValue(ExtraConstants.LAUNCH_GAME, true));
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/fragments/ModsFragment.java b/app_mojo/src/main/java/git/artdeell/mojo/fragments/ModsFragment.java
+new file mode 100644
+index 0000000..0961430
+--- /dev/null
++++ b/app_mojo/src/main/java/git/artdeell/mojo/fragments/ModsFragment.java
+@@ -0,0 +1,376 @@
++package git.artdeell.mojo.fragments;
++
++import android.content.ContentResolver;
++import android.database.Cursor;
++import android.graphics.Typeface;
++import android.net.Uri;
++import android.os.Bundle;
++import android.provider.OpenableColumns;
++import android.view.Gravity;
++import android.view.LayoutInflater;
++import android.view.View;
++import android.view.ViewGroup;
++import android.widget.BaseAdapter;
++import android.widget.Button;
++import android.widget.LinearLayout;
++import android.widget.ListView;
++import android.widget.TextView;
++import android.widget.Toast;
++
++import androidx.activity.result.ActivityResultLauncher;
++import androidx.activity.result.contract.ActivityResultContracts;
++import androidx.annotation.NonNull;
++import androidx.annotation.Nullable;
++import androidx.appcompat.widget.SwitchCompat;
++import androidx.fragment.app.Fragment;
++
++import com.google.gson.JsonArray;
++import com.google.gson.JsonElement;
++import com.google.gson.JsonObject;
++import com.google.gson.JsonParser;
++
++import git.artdeell.mojo.MojoApplication;
++import git.artdeell.mojo.Tools;
++import git.artdeell.mojo.instances.Instance;
++import git.artdeell.mojo.instances.Instances;
++
++import java.io.File;
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.InputStreamReader;
++import java.io.OutputStream;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.List;
++import java.util.Locale;
++import java.util.zip.ZipEntry;
++import java.util.zip.ZipFile;
++
++/**
++ * FrostFox: simple mod manager. Lists the jars in the selected instance's mods folder and lets
++ * the user switch each one on or off. A disabled mod is renamed to name.jar.disabled, which Forge
++ * ignores. Nothing is ever deleted.
++ */
++public class ModsFragment extends Fragment {
++    public static final String TAG = "ModsFragment";
++    private static final String DISABLED_SUFFIX = ".disabled";
++
++    private static class ModEntry {
++        File file;
++        String name;
++        String version;
++        boolean enabled;
++    }
++
++    private final List<ModEntry> mMods = new ArrayList<>();
++    private File mModsDir;
++    private TextView mSummary;
++    private TextView mEmpty;
++    private ModAdapter mAdapter;
++
++    private final ActivityResultLauncher<String[]> mPicker = registerForActivityResult(
++            new ActivityResultContracts.OpenMultipleDocuments(), this::onFilesPicked);
++
++    @Nullable
++    @Override
++    public View onCreateView(@NonNull LayoutInflater inflater, @Nullable ViewGroup container,
++                             @Nullable Bundle savedInstanceState) {
++        int pad = (int) Tools.dpToPx(16);
++        int gap = (int) Tools.dpToPx(8);
++
++        LinearLayout root = new LinearLayout(requireContext());
++        root.setOrientation(LinearLayout.VERTICAL);
++        root.setPadding(pad, pad, pad, pad);
++
++        TextView title = new TextView(requireContext());
++        title.setText("Mods");
++        title.setTextSize(22);
++        title.setTypeface(Typeface.DEFAULT_BOLD);
++        root.addView(title);
++
++        mSummary = new TextView(requireContext());
++        mSummary.setAlpha(0.7f);
++        root.addView(mSummary);
++
++        TextView hint = new TextView(requireContext());
++        hint.setText("Changes apply the next time you start the game.");
++        hint.setAlpha(0.7f);
++        hint.setPadding(0, 0, 0, gap);
++        root.addView(hint);
++
++        LinearLayout buttons = new LinearLayout(requireContext());
++        buttons.setOrientation(LinearLayout.HORIZONTAL);
++        buttons.addView(makeButton("Add mod", v -> mPicker.launch(new String[]{"*/*"})));
++        buttons.addView(makeButton("Enable all", v -> setAll(true)));
++        buttons.addView(makeButton("Disable all", v -> setAll(false)));
++        root.addView(buttons);
++
++        mEmpty = new TextView(requireContext());
++        mEmpty.setText("No mods yet. Tap \"Add mod\" or put .jar files in this instance's mods folder.");
++        mEmpty.setGravity(Gravity.CENTER);
++        mEmpty.setPadding(pad, pad * 2, pad, pad);
++        mEmpty.setVisibility(View.GONE);
++        root.addView(mEmpty);
++
++        ListView list = new ListView(requireContext());
++        mAdapter = new ModAdapter();
++        list.setAdapter(mAdapter);
++        list.setDividerHeight(0);
++        root.addView(list, new LinearLayout.LayoutParams(
++                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
++        return root;
++    }
++
++    private Button makeButton(String text, View.OnClickListener listener) {
++        Button button = new Button(requireContext());
++        button.setText(text);
++        button.setAllCaps(false);
++        button.setOnClickListener(listener);
++        button.setLayoutParams(new LinearLayout.LayoutParams(0,
++                ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
++        return button;
++    }
++
++    @Override
++    public void onViewCreated(@NonNull View view, @Nullable Bundle savedInstanceState) {
++        Instance instance = Instances.loadSelectedInstance();
++        if (instance == null) {
++            Toast.makeText(requireContext(), "No instance selected", Toast.LENGTH_LONG).show();
++            getParentFragmentManager().popBackStack();
++            return;
++        }
++        mModsDir = new File(instance.getGameDirectory(), "mods");
++        reload();
++    }
++
++    // ---------- scanning ----------
++
++    private void reload() {
++        final File modsDir = mModsDir;
++        MojoApplication.sExecutorService.execute(() -> {
++            List<ModEntry> found = new ArrayList<>();
++            scanDirectory(modsDir, found);
++            scanDirectory(new File(modsDir, "1.8.9"), found);
++            Collections.sort(found, (a, b) -> a.name.compareToIgnoreCase(b.name));
++            Tools.runOnUiThread(() -> {
++                if (!isAdded()) return;
++                mMods.clear();
++                mMods.addAll(found);
++                refreshViews();
++            });
++        });
++    }
++
++    private static boolean isModArchive(String lowerName) {
++        return lowerName.endsWith(".jar") || lowerName.endsWith(".zip");
++    }
++
++    private static void scanDirectory(File dir, List<ModEntry> out) {
++        File[] files = dir.listFiles();
++        if (files == null) return;
++        for (File file : files) {
++            if (!file.isFile()) continue;
++            String lower = file.getName().toLowerCase(Locale.ROOT);
++            boolean disabled = lower.endsWith(DISABLED_SUFFIX);
++            String base = disabled ? lower.substring(0, lower.length() - DISABLED_SUFFIX.length()) : lower;
++            if (!isModArchive(base)) continue;
++            ModEntry entry = new ModEntry();
++            entry.file = file;
++            entry.enabled = !disabled;
++            String shown = file.getName();
++            if (disabled) shown = shown.substring(0, shown.length() - DISABLED_SUFFIX.length());
++            entry.name = shown;
++            readModInfo(entry);
++            out.add(entry);
++        }
++    }
++
++    /** Reads the display name and version from mcmod.info, if there is one. */
++    private static void readModInfo(ModEntry entry) {
++        try (ZipFile zip = new ZipFile(entry.file)) {
++            ZipEntry info = zip.getEntry("mcmod.info");
++            if (info == null) return;
++            try (InputStream in = zip.getInputStream(info);
++                 InputStreamReader reader = new InputStreamReader(in, "UTF-8")) {
++                JsonElement root = new JsonParser().parse(reader);
++                JsonObject mod = null;
++                if (root.isJsonArray()) {
++                    JsonArray array = root.getAsJsonArray();
++                    if (array.size() > 0 && array.get(0).isJsonObject()) mod = array.get(0).getAsJsonObject();
++                } else if (root.isJsonObject()) {
++                    JsonObject object = root.getAsJsonObject();
++                    if (object.has("modList") && object.get("modList").isJsonArray()) {
++                        JsonArray array = object.getAsJsonArray("modList");
++                        if (array.size() > 0 && array.get(0).isJsonObject()) mod = array.get(0).getAsJsonObject();
++                    } else {
++                        mod = object;
++                    }
++                }
++                if (mod == null) return;
++                String name = stringOf(mod, "name");
++                if (name != null && !name.trim().isEmpty()) entry.name = name.trim();
++                entry.version = stringOf(mod, "version");
++            }
++        } catch (Exception ignored) {
++            // Unreadable or unusual metadata: fall back to the file name
++        }
++    }
++
++    private static String stringOf(JsonObject object, String key) {
++        if (!object.has(key) || !object.get(key).isJsonPrimitive()) return null;
++        return object.get(key).getAsString();
++    }
++
++    // ---------- toggling ----------
++
++    private boolean setEnabled(ModEntry entry, boolean enable) {
++        if (entry.enabled == enable) return true;
++        File current = entry.file;
++        String fileName = current.getName();
++        String newName = enable
++                ? fileName.substring(0, fileName.length() - DISABLED_SUFFIX.length())
++                : fileName + DISABLED_SUFFIX;
++        File target = new File(current.getParentFile(), newName);
++        if (target.exists() || !current.renameTo(target)) {
++            Toast.makeText(requireContext(), "Could not change " + entry.name, Toast.LENGTH_LONG).show();
++            return false;
++        }
++        entry.file = target;
++        entry.enabled = enable;
++        return true;
++    }
++
++    private void setAll(boolean enable) {
++        for (ModEntry entry : mMods) setEnabled(entry, enable);
++        refreshViews();
++    }
++
++    private void refreshViews() {
++        int enabledCount = 0;
++        for (ModEntry entry : mMods) if (entry.enabled) enabledCount++;
++        mSummary.setText(mMods.size() + " mods, " + enabledCount + " on");
++        mEmpty.setVisibility(mMods.isEmpty() ? View.VISIBLE : View.GONE);
++        mAdapter.notifyDataSetChanged();
++    }
++
++    // ---------- adding ----------
++
++    private void onFilesPicked(List<Uri> uris) {
++        if (uris == null || uris.isEmpty()) return;
++        final ContentResolver resolver = requireContext().getContentResolver();
++        final File modsDir = mModsDir;
++        MojoApplication.sExecutorService.execute(() -> {
++            int added = 0, skipped = 0;
++            for (Uri uri : uris) {
++                String name = displayName(resolver, uri);
++                if (name == null || !isModArchive(name.toLowerCase(Locale.ROOT))) {
++                    skipped++;
++                    continue;
++                }
++                File target = new File(modsDir, new File(name).getName());
++                File disabledTarget = new File(modsDir, target.getName() + DISABLED_SUFFIX);
++                if (target.exists() || disabledTarget.exists()) {
++                    skipped++;
++                    continue;
++                }
++                try {
++                    copy(resolver, uri, target);
++                    added++;
++                } catch (IOException e) {
++                    //noinspection ResultOfMethodCallIgnored
++                    target.delete();
++                    skipped++;
++                }
++            }
++            final int addedFinal = added, skippedFinal = skipped;
++            Tools.runOnUiThread(() -> {
++                if (!isAdded()) return;
++                String message = addedFinal + " added";
++                if (skippedFinal > 0) message += ", " + skippedFinal + " skipped (not a .jar, or already there)";
++                Toast.makeText(requireContext(), message, Toast.LENGTH_LONG).show();
++                reload();
++            });
++        });
++    }
++
++    private static String displayName(ContentResolver resolver, Uri uri) {
++        try (Cursor cursor = resolver.query(uri, new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null)) {
++            if (cursor != null && cursor.moveToFirst()) return cursor.getString(0);
++        } catch (Exception ignored) {
++        }
++        return uri.getLastPathSegment();
++    }
++
++    private static void copy(ContentResolver resolver, Uri uri, File target) throws IOException {
++        try (InputStream in = resolver.openInputStream(uri)) {
++            if (in == null) throw new IOException("Cannot open " + uri);
++            try (OutputStream out = new FileOutputStream(target)) {
++                byte[] buffer = new byte[16384];
++                int read;
++                while ((read = in.read(buffer)) != -1) out.write(buffer, 0, read);
++            }
++        }
++    }
++
++    // ---------- list rows ----------
++
++    private class ModAdapter extends BaseAdapter {
++        @Override public int getCount() { return mMods.size(); }
++        @Override public Object getItem(int position) { return mMods.get(position); }
++        @Override public long getItemId(int position) { return position; }
++
++        @Override
++        public View getView(int position, View convertView, ViewGroup parent) {
++            LinearLayout row;
++            TextView nameView, detailView;
++            SwitchCompat toggle;
++            if (convertView == null) {
++                int pad = (int) Tools.dpToPx(12);
++                row = new LinearLayout(parent.getContext());
++                row.setOrientation(LinearLayout.HORIZONTAL);
++                row.setGravity(Gravity.CENTER_VERTICAL);
++                row.setPadding(0, pad, 0, pad);
++
++                LinearLayout texts = new LinearLayout(parent.getContext());
++                texts.setOrientation(LinearLayout.VERTICAL);
++                nameView = new TextView(parent.getContext());
++                nameView.setTextSize(16);
++                nameView.setTag("name");
++                detailView = new TextView(parent.getContext());
++                detailView.setTextSize(12);
++                detailView.setAlpha(0.7f);
++                detailView.setTag("detail");
++                texts.addView(nameView);
++                texts.addView(detailView);
++                row.addView(texts, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
++
++                toggle = new SwitchCompat(parent.getContext());
++                toggle.setTag("toggle");
++                row.addView(toggle);
++            } else {
++                row = (LinearLayout) convertView;
++                nameView = row.findViewWithTag("name");
++                detailView = row.findViewWithTag("detail");
++                toggle = row.findViewWithTag("toggle");
++            }
++
++            final ModEntry entry = mMods.get(position);
++            nameView.setText(entry.name);
++            String detail = entry.version != null && !entry.version.isEmpty() ? "v" + entry.version + "  -  " : "";
++            detailView.setText(detail + entry.file.getName());
++            nameView.setAlpha(entry.enabled ? 1f : 0.5f);
++
++            toggle.setOnCheckedChangeListener(null);
++            toggle.setChecked(entry.enabled);
++            toggle.setOnCheckedChangeListener((button, checked) -> {
++                if (!setEnabled(entry, checked)) {
++                    button.setOnCheckedChangeListener(null);
++                    button.setChecked(entry.enabled);
++                }
++                refreshViews();
++            });
++            return row;
++        }
++    }
++}
