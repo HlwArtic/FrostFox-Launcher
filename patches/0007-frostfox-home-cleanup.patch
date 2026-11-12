@@ -1,0 +1,477 @@
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/authenticator/accounts/Account.java b/app_mojo/src/main/java/git/artdeell/mojo/authenticator/accounts/Account.java
+index 487095d0767d49e956ad377ef077bb67014a9bee..ad827179f03a9ef7cd7e844825d0cb34815ba924 100644
+--- a/app_mojo/src/main/java/git/artdeell/mojo/authenticator/accounts/Account.java
++++ b/app_mojo/src/main/java/git/artdeell/mojo/authenticator/accounts/Account.java
+@@ -89,7 +89,11 @@ public class Account {
+      }
+ 
+     public Bitmap getSkinFace(){
+-        if(isLocal()) return null;
++        if(isLocal()) {
++            // FrostFox: offline accounts get a small generated head
++            if(mFaceCache == null) mFaceCache = git.artdeell.mojo.frost.FrostHead.create(username);
++            return mFaceCache;
++        }
+         File skinFaceFile = getSkinFaceFile();
+         if(!skinFaceFile.exists()) return null;
+         if(mFaceCache == null) {
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/fragments/MainMenuFragment.java b/app_mojo/src/main/java/git/artdeell/mojo/fragments/MainMenuFragment.java
+index bf7cfb7c810d03bb435ead91de536aa988fc435d..fa39a6072ce1cf03f023f8138f0511d252bd5577 100644
+--- a/app_mojo/src/main/java/git/artdeell/mojo/fragments/MainMenuFragment.java
++++ b/app_mojo/src/main/java/git/artdeell/mojo/fragments/MainMenuFragment.java
+@@ -59,20 +59,11 @@ public class MainMenuFragment extends Fragment {
+         Button mPlayButton = view.findViewById(R.id.play_button);
+         mVersionSpinner = view.findViewById(R.id.mc_version_spinner);
+ 
+-        // FrostFox: this slot opens the performance presets instead of the news page
+-        mNewsButton.setText("Performance");
+-        mNewsButton.setOnClickListener(v -> Tools.swapFragment(requireActivity(), PerformanceFragment.class, PerformanceFragment.TAG, null));
+-        // FrostFox: this slot shows the About screen instead of the Discord invite
+-        mDiscordButton.setText("About");
+-        mDiscordButton.setOnClickListener(v -> new androidx.appcompat.app.AlertDialog.Builder(requireContext())
+-                .setTitle("FrostFox Launcher")
+-                .setMessage("A lightweight Minecraft 1.8.9 Forge launcher for Android.\n\n"
+-                        + "Based on MojoLauncher and PojavLauncher, which are licensed under the GNU LGPL v3. "
+-                        + "The source code of FrostFox Launcher is available in its repository on GitHub.\n\n"
+-                        + "FrostFox Launcher is not affiliated with Mojang or Microsoft. "
+-                        + "Minecraft is a trademark of Mojang Synergies AB.")
+-                .setPositiveButton(android.R.string.ok, null)
+-                .show());
++        // FrostFox: no news or social buttons on the home screen
++        mNewsButton.setVisibility(View.GONE);
++        mDiscordButton.setVisibility(View.GONE);
++        View socialDivider = view.findViewById(R.id.social_divider);
++        if (socialDivider != null) socialDivider.setVisibility(View.GONE);
+         // FrostFox: gentle falling snow behind the home screen
+         if (view instanceof android.view.ViewGroup) {
+             ((android.view.ViewGroup) view).addView(new git.artdeell.mojo.frost.SnowView(requireContext()), 0,
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/fragments/PerformanceFragment.java b/app_mojo/src/main/java/git/artdeell/mojo/fragments/PerformanceFragment.java
+deleted file mode 100644
+index 1025f1d33ba089a0146a21ce5c0a98cb5f069a92..0000000000000000000000000000000000000000
+--- a/app_mojo/src/main/java/git/artdeell/mojo/fragments/PerformanceFragment.java
++++ /dev/null
+@@ -1,241 +0,0 @@
+-package git.artdeell.mojo.fragments;
+-
+-import android.content.SharedPreferences;
+-import android.graphics.Typeface;
+-import android.os.Bundle;
+-import android.view.LayoutInflater;
+-import android.view.View;
+-import android.view.ViewGroup;
+-import android.widget.Button;
+-import android.widget.LinearLayout;
+-import android.widget.ScrollView;
+-import android.widget.TextView;
+-import android.widget.Toast;
+-
+-import androidx.annotation.NonNull;
+-import androidx.annotation.Nullable;
+-import androidx.appcompat.widget.SwitchCompat;
+-import androidx.fragment.app.Fragment;
+-
+-import git.artdeell.mojo.MojoApplication;
+-import git.artdeell.mojo.Tools;
+-import git.artdeell.mojo.frost.SnowView;
+-import git.artdeell.mojo.game.ThermalGovernor;
+-import git.artdeell.mojo.instances.Instance;
+-import git.artdeell.mojo.instances.Instances;
+-import git.artdeell.mojo.prefs.LauncherPreferences;
+-
+-import java.io.BufferedReader;
+-import java.io.BufferedWriter;
+-import java.io.File;
+-import java.io.FileInputStream;
+-import java.io.FileOutputStream;
+-import java.io.IOException;
+-import java.io.InputStreamReader;
+-import java.io.OutputStreamWriter;
+-import java.util.ArrayList;
+-import java.util.LinkedHashMap;
+-import java.util.List;
+-import java.util.Map;
+-
+-/**
+- * FrostFox: one-tap performance presets. A preset sets the launcher's resolution scale and
+- * sustained-performance mode, and writes the matching video options into the selected
+- * instance's options.txt. A preset is applied only when tapped, so later in-game changes stick.
+- */
+-public class PerformanceFragment extends Fragment {
+-    public static final String TAG = "PerformanceFragment";
+-    private static final String PREF_LAST_PRESET = "frostfoxPreset";
+-
+-    private static class Preset {
+-        final String name;
+-        final String description;
+-        final int resolutionPercent;
+-        final boolean sustained;
+-        final Map<String, String> options = new LinkedHashMap<>();
+-
+-        Preset(String name, String description, int resolutionPercent, boolean sustained,
+-               int renderDistance, int maxFps, int particles, int mipmaps) {
+-            this.name = name;
+-            this.description = description;
+-            this.resolutionPercent = resolutionPercent;
+-            this.sustained = sustained;
+-            options.put("renderDistance", String.valueOf(renderDistance));
+-            options.put("maxFps", String.valueOf(maxFps));
+-            options.put("fancyGraphics", "false");
+-            options.put("ao", "0");
+-            options.put("particles", String.valueOf(particles));
+-            options.put("clouds", "false");
+-            options.put("ofClouds", "3");
+-            options.put("entityShadows", "false");
+-            options.put("mipmapLevels", String.valueOf(mipmaps));
+-            options.put("enableVsync", "false");
+-        }
+-    }
+-
+-    private static final Preset[] PRESETS = {
+-            new Preset("Battery saver",
+-                    "Coolest and longest play time. Resolution 50%, 3 chunks, 30 FPS cap.",
+-                    50, true, 3, 30, 2, 0),
+-            new Preset("Balanced",
+-                    "Recommended. Resolution 70%, 4 chunks, 60 FPS cap, steady clocks.",
+-                    70, true, 4, 60, 2, 0),
+-            new Preset("Performance",
+-                    "Sharper and smoother, but warmer. Resolution 85%, 6 chunks, 120 FPS cap.",
+-                    85, false, 6, 120, 1, 2),
+-    };
+-
+-    private TextView mStatus;
+-
+-    @Nullable
+-    @Override
+-    public View onCreateView(@NonNull LayoutInflater inflater, @Nullable ViewGroup container,
+-                             @Nullable Bundle savedInstanceState) {
+-        int pad = (int) Tools.dpToPx(16);
+-        int gap = (int) Tools.dpToPx(12);
+-
+-        ScrollView scroll = new ScrollView(requireContext());
+-        LinearLayout root = new LinearLayout(requireContext());
+-        root.setOrientation(LinearLayout.VERTICAL);
+-        root.setPadding(pad, pad, pad, pad);
+-        scroll.addView(root);
+-
+-        TextView title = new TextView(requireContext());
+-        title.setText("Performance");
+-        title.setTextSize(22);
+-        title.setTypeface(Typeface.DEFAULT_BOLD);
+-        root.addView(title);
+-
+-        TextView intro = new TextView(requireContext());
+-        intro.setText("Pick a preset for the selected instance. It sets the resolution scale and the "
+-                + "game's video options (render distance, FPS cap, particles, clouds, shadows). "
+-                + "You can still change any setting afterwards; a preset only applies when you tap it.");
+-        intro.setAlpha(0.7f);
+-        intro.setPadding(0, 0, 0, gap);
+-        root.addView(intro);
+-
+-        mStatus = new TextView(requireContext());
+-        mStatus.setPadding(0, 0, 0, gap);
+-        root.addView(mStatus);
+-        updateStatus();
+-
+-        SwitchCompat thermalSwitch = new SwitchCompat(requireContext());
+-        thermalSwitch.setText("Auto-lower quality when the phone gets hot");
+-        thermalSwitch.setChecked(LauncherPreferences.DEFAULT_PREF.getBoolean(ThermalGovernor.PREF_KEY, true));
+-        thermalSwitch.setOnCheckedChangeListener((button, checked) ->
+-                LauncherPreferences.DEFAULT_PREF.edit().putBoolean(ThermalGovernor.PREF_KEY, checked).apply());
+-        root.addView(thermalSwitch);
+-
+-        TextView thermalHint = new TextView(requireContext());
+-        thermalHint.setText("In game, the resolution steps down when the phone heats up and comes back "
+-                + "slowly once it cools. Your saved settings are never changed.");
+-        thermalHint.setAlpha(0.7f);
+-        thermalHint.setTextSize(12);
+-        thermalHint.setPadding(0, 0, 0, gap * 2);
+-        root.addView(thermalHint);
+-
+-        SwitchCompat snowSwitch = new SwitchCompat(requireContext());
+-        snowSwitch.setText("Snow animation on the home screen");
+-        snowSwitch.setChecked(LauncherPreferences.DEFAULT_PREF.getBoolean(SnowView.PREF_KEY,
+-                SnowView.defaultEnabled(requireContext())));
+-        snowSwitch.setOnCheckedChangeListener((button, checked) ->
+-                LauncherPreferences.DEFAULT_PREF.edit().putBoolean(SnowView.PREF_KEY, checked).apply());
+-        root.addView(snowSwitch);
+-
+-        TextView snowHint = new TextView(requireContext());
+-        snowHint.setText("Stops by itself in battery saver mode. Off by default on phones with little memory.");
+-        snowHint.setAlpha(0.7f);
+-        snowHint.setTextSize(12);
+-        snowHint.setPadding(0, 0, 0, gap * 2);
+-        root.addView(snowHint);
+-
+-        for (Preset preset : PRESETS) {
+-            Button button = new Button(requireContext());
+-            button.setAllCaps(false);
+-            button.setText(preset.name);
+-            button.setOnClickListener(v -> apply(preset));
+-            root.addView(button);
+-
+-            TextView description = new TextView(requireContext());
+-            description.setText(preset.description);
+-            description.setAlpha(0.7f);
+-            description.setTextSize(12);
+-            description.setPadding(0, 0, 0, gap);
+-            root.addView(description);
+-        }
+-        return scroll;
+-    }
+-
+-    private void updateStatus() {
+-        String last = LauncherPreferences.DEFAULT_PREF.getString(PREF_LAST_PRESET, null);
+-        mStatus.setText(last == null ? "No preset applied yet." : "Last applied: " + last);
+-    }
+-
+-    private void apply(Preset preset) {
+-        Instance instance = Instances.loadSelectedInstance();
+-        if (instance == null) {
+-            Toast.makeText(requireContext(), "No instance selected", Toast.LENGTH_LONG).show();
+-            return;
+-        }
+-        final File optionsFile = new File(instance.getGameDirectory(), "options.txt");
+-
+-        SharedPreferences.Editor editor = LauncherPreferences.DEFAULT_PREF.edit();
+-        editor.putInt("resolutionRatio", preset.resolutionPercent);
+-        editor.putBoolean("sustainedPerformance", preset.sustained);
+-        editor.putString(PREF_LAST_PRESET, preset.name);
+-        editor.apply();
+-        LauncherPreferences.PREF_SCALE_FACTOR = preset.resolutionPercent / 100f;
+-
+-        MojoApplication.sExecutorService.execute(() -> {
+-            String message;
+-            try {
+-                mergeOptions(optionsFile, preset.options);
+-                message = preset.name + " applied";
+-            } catch (IOException e) {
+-                message = "Could not write options.txt: " + e.getMessage();
+-            }
+-            final String toast = message;
+-            Tools.runOnUiThread(() -> {
+-                if (!isAdded()) return;
+-                Toast.makeText(requireContext(), toast, Toast.LENGTH_LONG).show();
+-                updateStatus();
+-            });
+-        });
+-    }
+-
+-    /** Sets the given keys in options.txt and keeps every other line as it was. */
+-    private static void mergeOptions(File file, Map<String, String> values) throws IOException {
+-        List<String> lines = new ArrayList<>();
+-        if (file.exists()) {
+-            try (BufferedReader reader = new BufferedReader(
+-                    new InputStreamReader(new FileInputStream(file), "UTF-8"))) {
+-                String line;
+-                while ((line = reader.readLine()) != null) lines.add(line);
+-            }
+-        }
+-        Map<String, String> remaining = new LinkedHashMap<>(values);
+-        for (int i = 0; i < lines.size(); i++) {
+-            String line = lines.get(i);
+-            int colon = line.indexOf(':');
+-            if (colon <= 0) continue;
+-            String key = line.substring(0, colon);
+-            if (remaining.containsKey(key)) {
+-                lines.set(i, key + ":" + remaining.remove(key));
+-            }
+-        }
+-        for (Map.Entry<String, String> entry : remaining.entrySet()) {
+-            lines.add(entry.getKey() + ":" + entry.getValue());
+-        }
+-        File parent = file.getParentFile();
+-        if (parent != null && !parent.exists() && !parent.mkdirs()) {
+-            throw new IOException("Cannot create " + parent);
+-        }
+-        try (BufferedWriter writer = new BufferedWriter(
+-                new OutputStreamWriter(new FileOutputStream(file), "UTF-8"))) {
+-            for (String line : lines) {
+-                writer.write(line);
+-                writer.write('\n');
+-            }
+-        }
+-    }
+-}
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/frost/FrostHead.java b/app_mojo/src/main/java/git/artdeell/mojo/frost/FrostHead.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..bffa477234dbd35eda0ba294b494d568cde871d7
+--- /dev/null
++++ b/app_mojo/src/main/java/git/artdeell/mojo/frost/FrostHead.java
+@@ -0,0 +1,56 @@
++package git.artdeell.mojo.frost;
++
++import android.graphics.Bitmap;
++import android.graphics.Color;
++
++import java.util.Locale;
++
++/**
++ * FrostFox: a small pixel "player head" for accounts that have no skin (offline accounts).
++ * The colours come from the player name, so the same name always gets the same head.
++ * Original artwork: a plain 8x8 face, not taken from Minecraft.
++ */
++public final class FrostHead {
++    private static final int[] SKIN = {0xFFF5D0B5, 0xFFE0AC8A, 0xFFC68B63, 0xFF9C6644, 0xFF6F4A33};
++    private static final int[] HAIR = {0xFF3B2A1F, 0xFF1C1C24, 0xFFB5651D, 0xFFE8C766,
++            0xFF8E3B2F, 0xFF5A6B7D, 0xFFEDEDED};
++    private static final int EYE = 0xFF16213A;
++    private static final String[] GRID = {
++            "HHHHHHHH",
++            "HHHHHHHH",
++            "HSSSSSSH",
++            "HSESSESH",
++            "SSSSSSSS",
++            "SSSSSSSS",
++            "SSMMMMSS",
++            "SSSSSSSS",
++    };
++
++    private FrostHead() {
++    }
++
++    public static Bitmap create(String name) {
++        int hash = name == null ? 0 : name.toLowerCase(Locale.ROOT).hashCode();
++        int skin = SKIN[(hash & 0x7fffffff) % SKIN.length];
++        int hair = HAIR[((hash >>> 8) & 0x7fffffff) % HAIR.length];
++        int mouth = Color.rgb((int) (Color.red(skin) * 0.7f), (int) (Color.green(skin) * 0.7f),
++                (int) (Color.blue(skin) * 0.7f));
++
++        Bitmap small = Bitmap.createBitmap(8, 8, Bitmap.Config.ARGB_8888);
++        for (int y = 0; y < 8; y++) {
++            for (int x = 0; x < 8; x++) {
++                int color;
++                switch (GRID[y].charAt(x)) {
++                    case 'H': color = hair; break;
++                    case 'E': color = EYE; break;
++                    case 'M': color = mouth; break;
++                    default: color = skin; break;
++                }
++                small.setPixel(x, y, color);
++            }
++        }
++        Bitmap big = Bitmap.createScaledBitmap(small, 96, 96, false);
++        small.recycle();
++        return big;
++    }
++}
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/instances/FrostDefaults.java b/app_mojo/src/main/java/git/artdeell/mojo/instances/FrostDefaults.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..ad9548f222f773d40f4acc4f07bc7d657abc5248
+--- /dev/null
++++ b/app_mojo/src/main/java/git/artdeell/mojo/instances/FrostDefaults.java
+@@ -0,0 +1,83 @@
++package git.artdeell.mojo.instances;
++
++import git.artdeell.mojo.prefs.LauncherPreferences;
++
++import java.io.BufferedReader;
++import java.io.BufferedWriter;
++import java.io.File;
++import java.io.FileInputStream;
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.io.InputStreamReader;
++import java.io.OutputStreamWriter;
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++
++/**
++ * FrostFox: sensible video settings for every new instance (resolution 70%, 4 chunks, 60 FPS cap,
++ * light graphics). These are the settings that worked well on a mid-range phone. They are written
++ * once when an instance is created; after that the user's own changes always win.
++ */
++final class FrostDefaults {
++    private FrostDefaults() {
++    }
++
++    static void applyBalanced(File gameDirectory) {
++        try {
++            Map<String, String> options = new LinkedHashMap<>();
++            options.put("renderDistance", "4");
++            options.put("maxFps", "60");
++            options.put("fancyGraphics", "false");
++            options.put("ao", "0");
++            options.put("particles", "2");
++            options.put("clouds", "false");
++            options.put("ofClouds", "3");
++            options.put("entityShadows", "false");
++            options.put("mipmapLevels", "0");
++            options.put("enableVsync", "false");
++            mergeOptions(new File(gameDirectory, "options.txt"), options);
++        } catch (IOException ignored) {
++            // Defaults are a convenience; never block instance creation
++        }
++        if (LauncherPreferences.DEFAULT_PREF != null) {
++            android.content.SharedPreferences.Editor editor = LauncherPreferences.DEFAULT_PREF.edit();
++            if (!LauncherPreferences.DEFAULT_PREF.contains("resolutionRatio")) editor.putInt("resolutionRatio", 70);
++            if (!LauncherPreferences.DEFAULT_PREF.contains("sustainedPerformance")) editor.putBoolean("sustainedPerformance", true);
++            editor.apply();
++        }
++    }
++
++    /** Sets the given keys in options.txt and keeps every other line as it was. */
++    private static void mergeOptions(File file, Map<String, String> values) throws IOException {
++        List<String> lines = new ArrayList<>();
++        if (file.exists()) {
++            try (BufferedReader reader = new BufferedReader(
++                    new InputStreamReader(new FileInputStream(file), "UTF-8"))) {
++                String line;
++                while ((line = reader.readLine()) != null) lines.add(line);
++            }
++        }
++        Map<String, String> remaining = new LinkedHashMap<>(values);
++        for (int i = 0; i < lines.size(); i++) {
++            String line = lines.get(i);
++            int colon = line.indexOf(':');
++            if (colon <= 0) continue;
++            String key = line.substring(0, colon);
++            if (remaining.containsKey(key)) lines.set(i, key + ":" + remaining.remove(key));
++        }
++        for (Map.Entry<String, String> entry : remaining.entrySet()) {
++            lines.add(entry.getKey() + ":" + entry.getValue());
++        }
++        File parent = file.getParentFile();
++        if (parent != null && !parent.exists() && !parent.mkdirs()) throw new IOException("Cannot create " + parent);
++        try (BufferedWriter writer = new BufferedWriter(
++                new OutputStreamWriter(new FileOutputStream(file), "UTF-8"))) {
++            for (String line : lines) {
++                writer.write(line);
++                writer.write('\n');
++            }
++        }
++    }
++}
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/instances/InstanceAdapter.java b/app_mojo/src/main/java/git/artdeell/mojo/instances/InstanceAdapter.java
+index 7c98aa2fc217618a0fb6812f120c560282a66059..76d37cee2f8e1e7bba0388e07c44d298178c9c54 100644
+--- a/app_mojo/src/main/java/git/artdeell/mojo/instances/InstanceAdapter.java
++++ b/app_mojo/src/main/java/git/artdeell/mojo/instances/InstanceAdapter.java
+@@ -86,11 +86,10 @@ public class InstanceAdapter extends BaseAdapter {
+         else if (Instance.VERSION_LATEST_SNAPSHOT.equalsIgnoreCase(versionName))
+             versionName = v.getContext().getString(R.string.profiles_latest_snapshot);
+ 
+-        if (versionName == null && profileName != null)
+-            extendedTextView.setText(profileName);
+-        else if (versionName != null && profileName == null)
+-            extendedTextView.setText(versionName);
+-        else extendedTextView.setText(String.format("%s - %s", profileName, versionName));
++        // FrostFox: show the name the user chose; fall back to the version only if there is no name
++        if (profileName != null) extendedTextView.setText(profileName);
++        else if (versionName != null) extendedTextView.setText(versionName);
++        else extendedTextView.setText("");
+ 
+         // Set selected background if needed
+         if(idx == mSelectionIndex && displaySelection) {
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/instances/Instances.java b/app_mojo/src/main/java/git/artdeell/mojo/instances/Instances.java
+index 1484c3a97e2be8ad6a1956be24da9dde4d6980de..111ab335beb26b605983e6e2ead827ec72be9337 100644
+--- a/app_mojo/src/main/java/git/artdeell/mojo/instances/Instances.java
++++ b/app_mojo/src/main/java/git/artdeell/mojo/instances/Instances.java
+@@ -172,6 +172,7 @@ public class Instances {
+         instance.mInstanceRoot = root;
+         instanceSetter.setInstanceProperties(instance);
+         instance.write();
++        FrostDefaults.applyBalanced(instance.getGameDirectory());
+         return instance;
+     }
+ 
