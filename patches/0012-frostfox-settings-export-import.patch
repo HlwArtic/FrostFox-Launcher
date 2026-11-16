@@ -1,0 +1,453 @@
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/contracts/CreateZipDocument.java b/app_mojo/src/main/java/git/artdeell/mojo/contracts/CreateZipDocument.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..faa4dbb80a7f8fbcbdc00f238a065f4c640b8ff7
+--- /dev/null
++++ b/app_mojo/src/main/java/git/artdeell/mojo/contracts/CreateZipDocument.java
+@@ -0,0 +1,36 @@
++package git.artdeell.mojo.contracts;
++
++import android.app.Activity;
++import android.content.Context;
++import android.content.Intent;
++import android.net.Uri;
++
++import androidx.activity.result.contract.ActivityResultContract;
++import androidx.annotation.NonNull;
++import androidx.annotation.Nullable;
++
++/** Asks the user where to save a new .zip file. The input is the suggested file name. */
++public class CreateZipDocument extends ActivityResultContract<String, Uri> {
++    @NonNull
++    @Override
++    public Intent createIntent(@NonNull Context context, @NonNull String suggestedName) {
++        Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
++        intent.addCategory(Intent.CATEGORY_OPENABLE);
++        intent.setType("application/zip");
++        intent.putExtra(Intent.EXTRA_TITLE, suggestedName);
++        return intent;
++    }
++
++    @Nullable
++    @Override
++    public final SynchronousResult<Uri> getSynchronousResult(@NonNull Context context, @NonNull String input) {
++        return null;
++    }
++
++    @Nullable
++    @Override
++    public final Uri parseResult(int resultCode, @Nullable Intent intent) {
++        if (resultCode != Activity.RESULT_OK || intent == null) return null;
++        return intent.getData();
++    }
++}
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/frost/SettingsBackup.java b/app_mojo/src/main/java/git/artdeell/mojo/frost/SettingsBackup.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..54d12783a44e07cdfd6b28ecc801e89adad89021
+--- /dev/null
++++ b/app_mojo/src/main/java/git/artdeell/mojo/frost/SettingsBackup.java
+@@ -0,0 +1,301 @@
++package git.artdeell.mojo.frost;
++
++import android.content.Context;
++import android.content.SharedPreferences;
++
++import com.google.gson.JsonArray;
++import com.google.gson.JsonElement;
++import com.google.gson.JsonObject;
++import com.google.gson.JsonParser;
++
++import git.artdeell.mojo.Tools;
++import git.artdeell.mojo.prefs.LauncherPreferences;
++
++import java.io.BufferedInputStream;
++import java.io.BufferedOutputStream;
++import java.io.ByteArrayOutputStream;
++import java.io.File;
++import java.io.FileInputStream;
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.util.HashSet;
++import java.util.LinkedHashMap;
++import java.util.Locale;
++import java.util.Map;
++import java.util.Set;
++import java.util.zip.ZipEntry;
++import java.util.zip.ZipInputStream;
++import java.util.zip.ZipOutputStream;
++
++/**
++ * FrostFox: export and import of the launcher's settings in one .zip file.
++ * The file holds the global settings, the control layouts, and each instance's settings
++ * (its settings file plus options.txt and optionsof.txt). It never holds accounts, tokens, mods or worlds.
++ */
++public final class SettingsBackup {
++    private static final int FORMAT_VERSION = 1;
++    private static final String FORMAT_NAME = "frostfox-settings";
++    private static final String INSTANCE_FILE = "mojo_instance.json";
++    private static final String[] INSTANCE_EXTRA_FILES = {"options.txt", "optionsof.txt"};
++    private static final int MAX_ENTRY_BYTES = 8 * 1024 * 1024;
++    private static final int MAX_TOTAL_BYTES = 40 * 1024 * 1024;
++    private static final String[] DENIED_KEY_PARTS = {
++            "account", "token", "auth", "secret", "password", "currentinstance", "current_instance", "frostfoxpreset"
++    };
++
++    private SettingsBackup() {
++    }
++
++    private static File instancesRoot() {
++        return new File(Tools.DIR_GAME_HOME, "instances");
++    }
++
++    private static boolean isDeniedKey(String key) {
++        String lower = key.toLowerCase(Locale.ROOT);
++        if (lower.equals(String.valueOf(LauncherPreferences.PREF_KEY_CURRENT_INSTANCE).toLowerCase(Locale.ROOT))) return true;
++        for (String part : DENIED_KEY_PARTS) {
++            if (lower.contains(part)) return true;
++        }
++        return false;
++    }
++
++    private static boolean isSafeName(String name) {
++        return name != null && !name.isEmpty() && name.length() <= 120 && name.matches("[A-Za-z0-9._ -]+")
++                && !name.equals(".") && !name.equals("..");
++    }
++
++    // ---------------------------------------------------------------- export
++
++    public static void export(OutputStream out) throws IOException {
++        try (ZipOutputStream zip = new ZipOutputStream(new BufferedOutputStream(out))) {
++            JsonObject root = new JsonObject();
++            root.addProperty("format", FORMAT_NAME);
++            root.addProperty("version", FORMAT_VERSION);
++            JsonObject prefs = new JsonObject();
++            for (Map.Entry<String, ?> entry : LauncherPreferences.DEFAULT_PREF.getAll().entrySet()) {
++                if (isDeniedKey(entry.getKey())) continue;
++                JsonObject typed = toTyped(entry.getValue());
++                if (typed != null) prefs.add(entry.getKey(), typed);
++            }
++            root.add("prefs", prefs);
++            putBytes(zip, "settings.json", root.toString().getBytes("UTF-8"));
++
++            File[] controls = new File(Tools.CTRLMAP_PATH).listFiles();
++            if (controls != null) {
++                for (File file : controls) {
++                    if (file.isFile() && isSafeName(file.getName()) && file.length() <= MAX_ENTRY_BYTES) {
++                        putFile(zip, "controls/" + file.getName(), file);
++                    }
++                }
++            }
++
++            File[] instances = instancesRoot().listFiles();
++            if (instances != null) {
++                for (File dir : instances) {
++                    File instanceFile = new File(dir, INSTANCE_FILE);
++                    if (!dir.isDirectory() || !isSafeName(dir.getName()) || !instanceFile.isFile()) continue;
++                    JsonObject json = parse(readFile(instanceFile));
++                    json.remove("installer"); // absolute path on this phone, useless elsewhere
++                    putBytes(zip, "instances/" + dir.getName() + "/" + INSTANCE_FILE, json.toString().getBytes("UTF-8"));
++                    for (String extra : INSTANCE_EXTRA_FILES) {
++                        File file = new File(dir, extra);
++                        if (file.isFile() && file.length() <= MAX_ENTRY_BYTES) {
++                            putFile(zip, "instances/" + dir.getName() + "/" + extra, file);
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    private static JsonObject toTyped(Object value) {
++        JsonObject typed = new JsonObject();
++        if (value instanceof Boolean) {
++            typed.addProperty("t", "b");
++            typed.addProperty("v", (Boolean) value);
++        } else if (value instanceof Integer) {
++            typed.addProperty("t", "i");
++            typed.addProperty("v", (Integer) value);
++        } else if (value instanceof Long) {
++            typed.addProperty("t", "l");
++            typed.addProperty("v", (Long) value);
++        } else if (value instanceof Float) {
++            typed.addProperty("t", "f");
++            typed.addProperty("v", (Float) value);
++        } else if (value instanceof String) {
++            typed.addProperty("t", "s");
++            typed.addProperty("v", (String) value);
++        } else if (value instanceof Set) {
++            JsonArray array = new JsonArray();
++            for (Object item : (Set<?>) value) array.add(String.valueOf(item));
++            typed.addProperty("t", "ss");
++            typed.add("v", array);
++        } else {
++            return null;
++        }
++        return typed;
++    }
++
++    private static void putBytes(ZipOutputStream zip, String name, byte[] data) throws IOException {
++        zip.putNextEntry(new ZipEntry(name));
++        zip.write(data);
++        zip.closeEntry();
++    }
++
++    private static void putFile(ZipOutputStream zip, String name, File file) throws IOException {
++        putBytes(zip, name, readFile(file));
++    }
++
++    private static byte[] readFile(File file) throws IOException {
++        try (InputStream in = new FileInputStream(file)) {
++            return readAll(in, MAX_ENTRY_BYTES);
++        }
++    }
++
++    private static byte[] readAll(InputStream in, int limit) throws IOException {
++        ByteArrayOutputStream out = new ByteArrayOutputStream();
++        byte[] buffer = new byte[16384];
++        int read;
++        int total = 0;
++        while ((read = in.read(buffer)) != -1) {
++            total += read;
++            if (total > limit) throw new IOException("A file in the backup is too large");
++            out.write(buffer, 0, read);
++        }
++        return out.toByteArray();
++    }
++
++    private static JsonObject parse(byte[] data) throws IOException {
++        try {
++            JsonElement element = new JsonParser().parse(new String(data, "UTF-8"));
++            if (element.isJsonObject()) return element.getAsJsonObject();
++        } catch (RuntimeException ignored) {
++            // fall through
++        }
++        throw new IOException("A settings file is damaged");
++    }
++
++    // ---------------------------------------------------------------- import
++
++    /** Imports a file made by {@link #export}. Returns a short summary for the user. */
++    public static String importFrom(Context context, InputStream in) throws IOException {
++        Map<String, byte[]> entries = new LinkedHashMap<>();
++        int total = 0;
++        try (ZipInputStream zip = new ZipInputStream(new BufferedInputStream(in))) {
++            ZipEntry entry;
++            while ((entry = zip.getNextEntry()) != null) {
++                if (entry.isDirectory()) continue;
++                byte[] data = readAll(zip, MAX_ENTRY_BYTES);
++                total += data.length;
++                if (total > MAX_TOTAL_BYTES) throw new IOException("The backup is too large");
++                entries.put(entry.getName(), data);
++            }
++        }
++        byte[] settingsData = entries.get("settings.json");
++        if (settingsData == null) throw new IOException("This is not a FrostFox settings file");
++        JsonObject root = parse(settingsData);
++        if (!root.has("format") || !FORMAT_NAME.equals(root.get("format").getAsString())) {
++            throw new IOException("This is not a FrostFox settings file");
++        }
++
++        int settingsCount = applyPrefs(root);
++        int controlCount = 0;
++        int instanceCount = 0;
++
++        File controlDir = new File(Tools.CTRLMAP_PATH);
++        Set<String> instanceDirs = new HashSet<>();
++        for (Map.Entry<String, byte[]> entry : entries.entrySet()) {
++            String name = entry.getKey();
++            if (name.startsWith("controls/")) {
++                String fileName = name.substring("controls/".length());
++                if (!isSafeName(fileName)) continue;
++                if (!controlDir.isDirectory() && !controlDir.mkdirs()) continue;
++                writeFile(new File(controlDir, fileName), entry.getValue());
++                controlCount++;
++            } else if (name.startsWith("instances/") && name.endsWith("/" + INSTANCE_FILE)) {
++                String dirName = name.substring("instances/".length(), name.length() - INSTANCE_FILE.length() - 1);
++                if (isSafeName(dirName)) instanceDirs.add(dirName);
++            }
++        }
++        for (String dirName : instanceDirs) {
++            importInstance(dirName, entries);
++            instanceCount++;
++        }
++
++        LauncherPreferences.loadPreferences(context);
++        return settingsCount + " settings, " + controlCount + " control files and "
++                + instanceCount + " instance" + (instanceCount == 1 ? "" : "s") + " imported.";
++    }
++
++    private static int applyPrefs(JsonObject root) {
++        if (!root.has("prefs") || !root.get("prefs").isJsonObject()) return 0;
++        SharedPreferences.Editor editor = LauncherPreferences.DEFAULT_PREF.edit();
++        int count = 0;
++        for (Map.Entry<String, JsonElement> entry : root.getAsJsonObject("prefs").entrySet()) {
++            String key = entry.getKey();
++            if (isDeniedKey(key) || !entry.getValue().isJsonObject()) continue;
++            JsonObject typed = entry.getValue().getAsJsonObject();
++            if (!typed.has("t") || !typed.has("v")) continue;
++            try {
++                JsonElement value = typed.get("v");
++                switch (typed.get("t").getAsString()) {
++                    case "b": editor.putBoolean(key, value.getAsBoolean()); break;
++                    case "i": editor.putInt(key, value.getAsInt()); break;
++                    case "l": editor.putLong(key, value.getAsLong()); break;
++                    case "f": editor.putFloat(key, value.getAsFloat()); break;
++                    case "s": editor.putString(key, value.getAsString()); break;
++                    case "ss":
++                        Set<String> set = new HashSet<>();
++                        for (JsonElement item : value.getAsJsonArray()) set.add(item.getAsString());
++                        editor.putStringSet(key, set);
++                        break;
++                    default: continue;
++                }
++                count++;
++            } catch (RuntimeException ignored) {
++                // A damaged entry is skipped, the rest still imports
++            }
++        }
++        editor.apply();
++        return count;
++    }
++
++    private static void importInstance(String dirName, Map<String, byte[]> entries) throws IOException {
++        File dir = new File(instancesRoot(), dirName);
++        if (!dir.isDirectory() && !dir.mkdirs()) throw new IOException("Could not create the instance folder " + dirName);
++        File modsDir = new File(dir, "mods");
++        if (!modsDir.isDirectory()) //noinspection ResultOfMethodCallIgnored
++            modsDir.mkdirs();
++
++        JsonObject imported = parse(entries.get("instances/" + dirName + "/" + INSTANCE_FILE));
++        imported.remove("installer");
++        File localFile = new File(dir, INSTANCE_FILE);
++        if (localFile.isFile()) {
++            // Existing instance: keep which game version it runs; take the rest from the backup
++            JsonObject current = parse(readFile(localFile));
++            for (String key : new String[]{"versionId", "autoForge", "installer"}) {
++                if (current.has(key)) imported.add(key, current.get(key));
++                else imported.remove(key);
++            }
++        } else if (imported.has("versionId") && imported.get("versionId").isJsonPrimitive()
++                && imported.get("versionId").getAsString().toLowerCase(Locale.ROOT).contains("forge")) {
++            // New instance on this phone: Forge is not installed here yet, so let it install on first Play
++            imported.addProperty("versionId", "1.8.9");
++            imported.addProperty("autoForge", true);
++        }
++        writeFile(localFile, imported.toString().getBytes("UTF-8"));
++
++        for (String extra : INSTANCE_EXTRA_FILES) {
++            byte[] data = entries.get("instances/" + dirName + "/" + extra);
++            if (data != null) writeFile(new File(dir, extra), data);
++        }
++    }
++
++    private static void writeFile(File file, byte[] data) throws IOException {
++        try (OutputStream out = new FileOutputStream(file)) {
++            out.write(data);
++        }
++    }
++}
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/prefs/screens/LauncherPreferenceMiscellaneousFragment.java b/app_mojo/src/main/java/git/artdeell/mojo/prefs/screens/LauncherPreferenceMiscellaneousFragment.java
+index 39ca28dd40e1030ac9054486246ad99d9081e88c..ea77736acb3c726eb7e0803a742873305f4df40e 100644
+--- a/app_mojo/src/main/java/git/artdeell/mojo/prefs/screens/LauncherPreferenceMiscellaneousFragment.java
++++ b/app_mojo/src/main/java/git/artdeell/mojo/prefs/screens/LauncherPreferenceMiscellaneousFragment.java
+@@ -40,6 +40,63 @@ public class LauncherPreferenceMiscellaneousFragment extends LauncherPreferenceF
+             }
+     );
+ 
++    // FrostFox: settings export and import
++    private final ActivityResultLauncher<String> mExportLauncher = registerForActivityResult(
++            new git.artdeell.mojo.contracts.CreateZipDocument(), uri -> {
++                if(uri != null) runExport(uri);
++            });
++    private final ActivityResultLauncher<Object> mImportLauncher = registerForActivityResult(
++            new git.artdeell.mojo.contracts.OpenDocumentWithExtension("zip"), uri -> {
++                if(uri != null) confirmImport(uri);
++            });
++
++    private void runExport(Uri uri) {
++        final android.content.Context context = getLauncherActivity().getApplicationContext();
++        MojoApplication.sExecutorService.execute(() -> {
++            String message;
++            try (java.io.OutputStream out = context.getContentResolver().openOutputStream(uri)) {
++                if(out == null) throw new IOException("Could not open the file");
++                git.artdeell.mojo.frost.SettingsBackup.export(out);
++                message = "Settings exported";
++            } catch (IOException e) {
++                message = "Export failed: " + e.getMessage();
++            }
++            final String toast = message;
++            Tools.runOnUiThread(() -> Toast.makeText(context, toast, Toast.LENGTH_LONG).show());
++        });
++    }
++
++    private void confirmImport(Uri uri) {
++        new AlertDialog.Builder(getLauncherActivity())
++                .setTitle("Import settings")
++                .setMessage("This replaces your current launcher settings and control layouts with the ones in the file. "
++                        + "Instances with the same folder name get their settings replaced; mods and worlds are not touched. "
++                        + "Accounts are never changed.")
++                .setPositiveButton(android.R.string.ok, (d, w) -> runImport(uri))
++                .setNegativeButton(android.R.string.cancel, null)
++                .show();
++    }
++
++    private void runImport(Uri uri) {
++        final LauncherActivity activity = getLauncherActivity();
++        MojoApplication.sExecutorService.execute(() -> {
++            String message;
++            try (java.io.InputStream in = activity.getContentResolver().openInputStream(uri)) {
++                if(in == null) throw new IOException("Could not open the file");
++                message = git.artdeell.mojo.frost.SettingsBackup.importFrom(activity, in)
++                        + "\n\nClose and reopen the launcher to apply everything.";
++            } catch (IOException e) {
++                message = "Import failed: " + e.getMessage();
++            }
++            final String text = message;
++            Tools.runOnUiThread(() -> new AlertDialog.Builder(activity)
++                    .setTitle("Import settings")
++                    .setMessage(text)
++                    .setPositiveButton(android.R.string.ok, null)
++                    .show());
++        });
++    }
++
+     @Override
+     public void onCreatePreferences(Bundle b, String str) {
+         mVisibilityUpdater = this::updateVisibility;
+@@ -50,6 +107,14 @@ public class LauncherPreferenceMiscellaneousFragment extends LauncherPreferenceF
+             mMigrateLauncher.launch(null);
+             return true;
+         });
++        requirePreference("frostExportSettings").setOnPreferenceClickListener(preference -> {
++            mExportLauncher.launch("frostfox-settings.zip");
++            return true;
++        });
++        requirePreference("frostImportSettings").setOnPreferenceClickListener(preference -> {
++            mImportLauncher.launch(null);
++            return true;
++        });
+         setupCacheClearPreference();
+         setupMicrophoneRequestPreference();
+         updateVisibility();
+diff --git a/app_mojo/src/main/res/xml/pref_misc.xml b/app_mojo/src/main/res/xml/pref_misc.xml
+index 1a9561efbb1eeca98c1baea6c056870087e8f8d5..33d2caf194da0c30511afc8bdc854b728a0197dc 100644
+--- a/app_mojo/src/main/res/xml/pref_misc.xml
++++ b/app_mojo/src/main/res/xml/pref_misc.xml
+@@ -11,6 +11,16 @@
+             android:icon="@drawable/ic_px_data_import"
+             android:title="@string/preference_data_migration_title"
+             android:summary="@string/preference_data_migration_summary" />
++        <Preference
++            android:key="frostExportSettings"
++            android:icon="@drawable/ic_px_data_import"
++            android:title="Export settings"
++            android:summary="Save your launcher settings, control layouts and instance settings into one file. Accounts are never included." />
++        <Preference
++            android:key="frostImportSettings"
++            android:icon="@drawable/ic_px_data_import"
++            android:title="Import settings"
++            android:summary="Load a file made with Export settings, for example on a new phone." />
+         <Preference
+             android:key="clearMetadataCache"
+             android:title="@string/preference_metadata_clear"
