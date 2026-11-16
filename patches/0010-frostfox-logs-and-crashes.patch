@@ -1,0 +1,549 @@
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/fragments/LogsFragment.java b/app_mojo/src/main/java/git/artdeell/mojo/fragments/LogsFragment.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..259ee758c9dc0be6d6bfa80ded72d27c29c81e0b
+--- /dev/null
++++ b/app_mojo/src/main/java/git/artdeell/mojo/fragments/LogsFragment.java
+@@ -0,0 +1,296 @@
++package git.artdeell.mojo.fragments;
++
++import android.content.ClipData;
++import android.content.ClipboardManager;
++import android.content.Context;
++import android.graphics.Typeface;
++import android.os.Bundle;
++import android.view.LayoutInflater;
++import android.view.View;
++import android.view.ViewGroup;
++import android.widget.Button;
++import android.widget.LinearLayout;
++import android.widget.ScrollView;
++import android.widget.TextView;
++import android.widget.Toast;
++
++import androidx.annotation.NonNull;
++import androidx.annotation.Nullable;
++import androidx.appcompat.app.AlertDialog;
++import androidx.appcompat.widget.SwitchCompat;
++import androidx.fragment.app.Fragment;
++
++import git.artdeell.mojo.MojoApplication;
++import git.artdeell.mojo.Tools;
++import git.artdeell.mojo.frost.CrashAnalyzer;
++import git.artdeell.mojo.instances.Instance;
++import git.artdeell.mojo.instances.Instances;
++
++import java.io.File;
++import java.io.IOException;
++import java.io.RandomAccessFile;
++import java.text.SimpleDateFormat;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.Date;
++import java.util.List;
++import java.util.Locale;
++
++/**
++ * FrostFox: log viewer and crash reports in one screen. Shows the end of the game log (with an
++ * "errors only" filter), and lists the instance's crash reports. For a Forge crash report it names
++ * the mod most likely responsible and can switch that mod off with one tap.
++ */
++public class LogsFragment extends Fragment {
++    public static final String TAG = "LogsFragment";
++    private static final int MAX_TAIL_BYTES = 200 * 1024;
++    private static final int MAX_LINES = 800;
++
++    private TextView mLogText;
++    private ScrollView mScroll;
++    private SwitchCompat mErrorsOnly;
++    private String mVisibleLog = "";
++
++    @Nullable
++    @Override
++    public View onCreateView(@NonNull LayoutInflater inflater, @Nullable ViewGroup container,
++                             @Nullable Bundle savedInstanceState) {
++        int pad = (int) Tools.dpToPx(16);
++        int gap = (int) Tools.dpToPx(8);
++
++        LinearLayout root = new LinearLayout(requireContext());
++        root.setOrientation(LinearLayout.VERTICAL);
++        root.setPadding(pad, pad, pad, pad);
++
++        TextView title = new TextView(requireContext());
++        title.setText("Logs");
++        title.setTextSize(22);
++        title.setTypeface(Typeface.DEFAULT_BOLD);
++        root.addView(title);
++
++        mErrorsOnly = new SwitchCompat(requireContext());
++        mErrorsOnly.setText("Show only warnings and errors");
++        mErrorsOnly.setPadding(0, gap, 0, gap);
++        mErrorsOnly.setOnCheckedChangeListener((button, checked) -> loadLog());
++        root.addView(mErrorsOnly);
++
++        LinearLayout row1 = new LinearLayout(requireContext());
++        row1.addView(makeButton("Refresh", v -> loadLog()));
++        row1.addView(makeButton("Crash reports", v -> showCrashList()));
++        root.addView(row1);
++
++        LinearLayout row2 = new LinearLayout(requireContext());
++        row2.addView(makeButton("Copy", v -> copyLog()));
++        row2.addView(makeButton("Share", v -> Tools.shareLog(requireContext())));
++        root.addView(row2);
++
++        mScroll = new ScrollView(requireContext());
++        mLogText = new TextView(requireContext());
++        mLogText.setTypeface(Typeface.MONOSPACE);
++        mLogText.setTextSize(11);
++        mLogText.setTextIsSelectable(true);
++        mLogText.setPadding(0, gap, 0, 0);
++        mScroll.addView(mLogText);
++        root.addView(mScroll, new LinearLayout.LayoutParams(
++                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
++        return root;
++    }
++
++    private Button makeButton(String text, View.OnClickListener listener) {
++        Button button = new Button(requireContext());
++        button.setText(text);
++        button.setAllCaps(false);
++        button.setOnClickListener(listener);
++        button.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
++        return button;
++    }
++
++    @Override
++    public void onViewCreated(@NonNull View view, @Nullable Bundle savedInstanceState) {
++        loadLog();
++    }
++
++    // ---------- game log ----------
++
++    private void loadLog() {
++        final boolean errorsOnly = mErrorsOnly.isChecked();
++        MojoApplication.sExecutorService.execute(() -> {
++            String text;
++            try {
++                text = readLogTail(new File(Tools.DIR_GAME_HOME, "latestlog.txt"), errorsOnly);
++            } catch (IOException e) {
++                text = "Could not read the log: " + e.getMessage();
++            }
++            final String shown = text;
++            Tools.runOnUiThread(() -> {
++                if (!isAdded()) return;
++                mVisibleLog = shown;
++                mLogText.setText(shown);
++                mScroll.post(() -> mScroll.fullScroll(View.FOCUS_DOWN));
++            });
++        });
++    }
++
++    private static String readLogTail(File file, boolean errorsOnly) throws IOException {
++        if (!file.exists()) return "No log yet. Start the game once and come back.";
++        byte[] data;
++        boolean cut = false;
++        try (RandomAccessFile raf = new RandomAccessFile(file, "r")) {
++            long length = raf.length();
++            long start = Math.max(0, length - MAX_TAIL_BYTES);
++            cut = start > 0;
++            data = new byte[(int) (length - start)];
++            raf.seek(start);
++            raf.readFully(data);
++        }
++        String text = new String(data, "UTF-8");
++        if (cut) {
++            int newline = text.indexOf('\n');
++            if (newline >= 0) text = text.substring(newline + 1);
++        }
++        List<String> kept = new ArrayList<>();
++        boolean afterError = false;
++        for (String line : text.split("\n")) {
++            if (!errorsOnly) {
++                kept.add(line);
++                continue;
++            }
++            boolean important = line.contains("/ERROR]") || line.contains("/WARN]") || line.contains("/FATAL]")
++                    || line.contains("Exception") || line.contains("Caused by") || line.contains("Error:");
++            boolean frame = line.startsWith("\tat ") || line.startsWith("    at ");
++            if (important || (frame && afterError)) {
++                kept.add(line);
++                afterError = true;
++            } else {
++                afterError = false;
++            }
++        }
++        if (kept.size() > MAX_LINES) kept = kept.subList(kept.size() - MAX_LINES, kept.size());
++        if (kept.isEmpty()) return errorsOnly ? "No warnings or errors in the log." : "The log is empty.";
++        StringBuilder out = new StringBuilder();
++        for (String line : kept) out.append(line).append('\n');
++        return out.toString();
++    }
++
++    private void copyLog() {
++        ClipboardManager clipboard = (ClipboardManager) requireContext().getSystemService(Context.CLIPBOARD_SERVICE);
++        if (clipboard == null) return;
++        clipboard.setPrimaryClip(ClipData.newPlainText("FrostFox log", mVisibleLog));
++        Toast.makeText(requireContext(), "Log copied", Toast.LENGTH_SHORT).show();
++    }
++
++    // ---------- crash reports ----------
++
++    private List<File> modFolders(Instance instance) {
++        File mods = new File(instance.getGameDirectory(), "mods");
++        return Arrays.asList(mods, new File(mods, "1.8.9"));
++    }
++
++    private void showCrashList() {
++        Instance instance = Instances.loadSelectedInstance();
++        if (instance == null) {
++            Toast.makeText(requireContext(), "No instance selected", Toast.LENGTH_LONG).show();
++            return;
++        }
++        File gameDir = instance.getGameDirectory();
++        final List<File> reports = new ArrayList<>();
++        File[] crashFiles = new File(gameDir, "crash-reports").listFiles();
++        if (crashFiles != null) {
++            for (File file : crashFiles) if (file.isFile() && file.getName().endsWith(".txt")) reports.add(file);
++        }
++        File[] javaCrashes = gameDir.listFiles();
++        if (javaCrashes != null) {
++            for (File file : javaCrashes) {
++                if (file.isFile() && file.getName().startsWith("hs_err_pid")) reports.add(file);
++            }
++        }
++        if (reports.isEmpty()) {
++            Toast.makeText(requireContext(), "No crash reports. That's good news.", Toast.LENGTH_LONG).show();
++            return;
++        }
++        Collections.sort(reports, (a, b) -> Long.compare(b.lastModified(), a.lastModified()));
++        final List<File> shown = reports.size() > 20 ? reports.subList(0, 20) : reports;
++        SimpleDateFormat format = new SimpleDateFormat("MMM d, HH:mm", Locale.getDefault());
++        String[] labels = new String[shown.size()];
++        for (int i = 0; i < labels.length; i++) {
++            File file = shown.get(i);
++            String kind = file.getName().startsWith("hs_err_pid") ? "Java crash" : "Game crash";
++            labels[i] = format.format(new Date(file.lastModified())) + "  -  " + kind;
++        }
++        new AlertDialog.Builder(requireContext())
++                .setTitle("Crash reports")
++                .setItems(labels, (dialog, which) -> showCrash(instance, shown.get(which)))
++                .setNegativeButton("Close", null)
++                .show();
++    }
++
++    private void showCrash(Instance instance, File report) {
++        if (report.getName().startsWith("hs_err_pid")) {
++            new AlertDialog.Builder(requireContext())
++                    .setTitle("Java crash")
++                    .setMessage("Java itself stopped, which is usually not caused by a mod. "
++                            + "The most common reasons are too little free memory or a graphics driver problem. "
++                            + "Try the Battery saver settings and close other apps. "
++                            + "You can share this report if you want help.")
++                    .setNeutralButton("Share report", (d, w) -> Tools.openPath(requireContext(), report, true))
++                    .setNegativeButton("Close", null)
++                    .show();
++            return;
++        }
++        final List<File> folders = modFolders(instance);
++        MojoApplication.sExecutorService.execute(() -> {
++            CrashAnalyzer.Result result = null;
++            String failure = null;
++            try {
++                result = CrashAnalyzer.analyze(report, folders);
++            } catch (IOException e) {
++                failure = e.getMessage();
++            }
++            final CrashAnalyzer.Result finalResult = result;
++            final String finalFailure = failure;
++            Tools.runOnUiThread(() -> {
++                if (!isAdded()) return;
++                showCrashDialog(report, finalResult, finalFailure);
++            });
++        });
++    }
++
++    private void showCrashDialog(File report, CrashAnalyzer.Result result, String failure) {
++        StringBuilder message = new StringBuilder();
++        if (result == null) {
++            message.append("Could not read this report: ").append(failure);
++        } else {
++            if (result.description != null) message.append("What happened: ").append(result.description).append("\n\n");
++            if (result.errorLine != null) message.append("Error: ").append(result.errorLine).append("\n\n");
++            if (result.suspectedName != null) {
++                message.append("Most likely mod: ").append(result.suspectedName);
++                if (result.reason != null) message.append("\n").append(result.reason);
++                if (result.suspectedFile == null) message.append("\n(Its file was not found in the mods folder.)");
++            } else {
++                message.append("No mod could be blamed. If you just added or changed mods, "
++                        + "try switching off the newest one.");
++            }
++        }
++        AlertDialog.Builder builder = new AlertDialog.Builder(requireContext())
++                .setTitle("Crash report")
++                .setMessage(message.toString())
++                .setNeutralButton("Share report", (d, w) -> Tools.openPath(requireContext(), report, true))
++                .setNegativeButton("Close", null);
++        if (result != null && result.suspectedFile != null
++                && !result.suspectedFile.getName().toLowerCase(Locale.ROOT).endsWith(".disabled")) {
++            final File suspect = result.suspectedFile;
++            final String name = result.suspectedName;
++            builder.setPositiveButton("Switch off " + name, (d, w) -> {
++                File target = new File(suspect.getParentFile(), suspect.getName() + ".disabled");
++                if (!target.exists() && suspect.renameTo(target)) {
++                    Toast.makeText(requireContext(), name + " switched off. You can turn it back on in Mods.",
++                            Toast.LENGTH_LONG).show();
++                } else {
++                    Toast.makeText(requireContext(), "Could not switch off " + name, Toast.LENGTH_LONG).show();
++                }
++            });
++        }
++        builder.show();
++    }
++}
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/fragments/MainMenuFragment.java b/app_mojo/src/main/java/git/artdeell/mojo/fragments/MainMenuFragment.java
+index f1617ba8cb0823a04c6a1b509f6189828a37b50d..e7dee377e7878748f3702471df5f27521bd4766e 100644
+--- a/app_mojo/src/main/java/git/artdeell/mojo/fragments/MainMenuFragment.java
++++ b/app_mojo/src/main/java/git/artdeell/mojo/fragments/MainMenuFragment.java
+@@ -71,7 +71,8 @@ public class MainMenuFragment extends Fragment {
+ 
+         mPlayButton.setOnClickListener(v -> ExtraCore.setValue(ExtraConstants.LAUNCH_GAME, true));
+ 
+-        mShareLogsButton.setOnClickListener((v) -> shareLog(requireContext()));
++        // FrostFox: the Logs card opens the log viewer and crash reports
++        mShareLogsButton.setOnClickListener(v -> Tools.swapFragment(requireActivity(), LogsFragment.class, LogsFragment.TAG, null));
+ 
+         mOpenDirectoryButton.setOnClickListener((v)-> openGameDirectory(v.getContext()));
+ 
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/frost/CrashAnalyzer.java b/app_mojo/src/main/java/git/artdeell/mojo/frost/CrashAnalyzer.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..6075cd476c6e23103852ed4711b81caca225771a
+--- /dev/null
++++ b/app_mojo/src/main/java/git/artdeell/mojo/frost/CrashAnalyzer.java
+@@ -0,0 +1,201 @@
++package git.artdeell.mojo.frost;
++
++import java.io.BufferedReader;
++import java.io.File;
++import java.io.FileInputStream;
++import java.io.IOException;
++import java.io.InputStreamReader;
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Locale;
++import java.util.Map;
++import java.util.Set;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++import java.util.zip.ZipFile;
++
++/**
++ * FrostFox: reads a Forge 1.8.9 crash report and works out which mod most likely caused it.
++ * Two clues are used: mods that Forge itself marks as errored in the mod list, and which mod
++ * jar contains the classes named in the error's stack trace. No Android classes are used here.
++ */
++public final class CrashAnalyzer {
++    public static final class Result {
++        public String description;
++        public String errorLine;
++        /** Display name of the suspected mod, or null if none could be named. */
++        public String suspectedName;
++        /** The suspected mod's jar in the mods folder, or null if it could not be matched. */
++        public File suspectedFile;
++        /** Short explanation of why this mod was picked. */
++        public String reason;
++    }
++
++    private static final int MAX_REPORT_CHARS = 600_000;
++    private static final Pattern FRAME = Pattern.compile("^\\s+at ([\\w.$]+)\\.[\\w$<>]+\\(");
++    private static final Pattern ERROR_LINE = Pattern.compile("^[A-Za-z_$][\\w.$]*(Exception|Error|Throwable)(:.*)?$");
++    private static final Pattern MOD_ROW = Pattern.compile("^\\s*([ULCHIJADE]{3,})\\s+(.+?)\\{(.*?)\\}\\s+\\[(.*?)\\]\\s+\\((.*?)\\)");
++    private static final String[] IGNORED_PREFIXES = {
++            "java.", "javax.", "sun.", "jdk.", "com.sun.", "net.minecraft.", "net.minecraftforge.", "cpw.mods.",
++            "org.lwjgl.", "com.google.", "org.apache.", "io.netty.", "org.objectweb.", "com.mojang.",
++            "paulscode.", "org.spongepowered.", "net.minecraft", "git.artdeell.", "android.", "dalvik."
++    };
++
++    private CrashAnalyzer() {
++    }
++
++    public static Result analyze(File report, List<File> modFolders) throws IOException {
++        List<String> lines = readLines(report);
++        Result result = new Result();
++
++        boolean afterDescription = false;
++        List<String> frames = new ArrayList<>();
++        boolean inFirstTrace = true;
++        List<ModRow> erroredRows = new ArrayList<>();
++        boolean inModList = false;
++
++        for (String line : lines) {
++            if (line.startsWith("Description:")) {
++                result.description = line.substring("Description:".length()).trim();
++                afterDescription = true;
++                continue;
++            }
++            if (afterDescription && result.errorLine == null && ERROR_LINE.matcher(line.trim()).matches()) {
++                result.errorLine = line.trim();
++            }
++            if (line.startsWith("A detailed walkthrough")) inFirstTrace = false;
++            if (inFirstTrace) {
++                Matcher frame = FRAME.matcher(line);
++                if (frame.find()) frames.add(frame.group(1));
++            }
++            if (line.trim().startsWith("States:")) {
++                inModList = true;
++                continue;
++            }
++            if (inModList) {
++                Matcher row = MOD_ROW.matcher(line);
++                if (row.find()) {
++                    if (row.group(1).indexOf('E') >= 0) {
++                        String display = row.group(4).trim();
++                        erroredRows.add(new ModRow(display.isEmpty() ? row.group(2).trim() : display, row.group(5).trim()));
++                    }
++                } else if (!line.trim().isEmpty() && !line.startsWith("\t") && !line.startsWith(" ")) {
++                    inModList = false;
++                }
++            }
++        }
++
++        List<File> mods = collectMods(modFolders);
++
++        // Clue 1: Forge marked a mod as errored
++        for (ModRow row : erroredRows) {
++            if (isBuiltIn(row.name)) continue;
++            File jar = findByName(mods, row.file);
++            result.suspectedName = row.name;
++            result.suspectedFile = jar;
++            result.reason = "Forge marked this mod as errored.";
++            return result;
++        }
++
++        // Clue 2: whose classes appear in the stack trace
++        Set<String> classes = new LinkedHashSet<>();
++        for (String className : frames) {
++            if (!isIgnored(className)) classes.add(className);
++        }
++        Map<File, Integer> score = new LinkedHashMap<>();
++        for (File jar : mods) {
++            try (ZipFile zip = new ZipFile(jar)) {
++                int hits = 0;
++                for (String className : classes) {
++                    if (zip.getEntry(className.replace('.', '/') + ".class") != null) hits++;
++                }
++                if (hits > 0) score.put(jar, hits);
++            } catch (IOException ignored) {
++                // Unreadable jar: skip it
++            }
++        }
++        File best = null;
++        int bestScore = 0;
++        for (Map.Entry<File, Integer> entry : score.entrySet()) {
++            if (entry.getValue() > bestScore) {
++                bestScore = entry.getValue();
++                best = entry.getKey();
++            }
++        }
++        if (best != null) {
++            result.suspectedFile = best;
++            result.suspectedName = displayName(best);
++            result.reason = "Its code appears " + bestScore + (bestScore == 1 ? " time" : " times")
++                    + " in the error's stack trace.";
++        }
++        return result;
++    }
++
++    private static final class ModRow {
++        final String name;
++        final String file;
++
++        ModRow(String name, String file) {
++            this.name = name;
++            this.file = file;
++        }
++    }
++
++    private static boolean isBuiltIn(String name) {
++        String lower = name.toLowerCase(Locale.ROOT);
++        return lower.startsWith("mcp") || lower.startsWith("fml") || lower.startsWith("forge")
++                || lower.contains("minecraft coder pack") || lower.contains("forge mod loader")
++                || lower.contains("minecraft forge");
++    }
++
++    private static boolean isIgnored(String className) {
++        for (String prefix : IGNORED_PREFIXES) {
++            if (className.startsWith(prefix)) return true;
++        }
++        return false;
++    }
++
++    private static List<File> collectMods(List<File> folders) {
++        List<File> out = new ArrayList<>();
++        for (File folder : folders) {
++            File[] files = folder.listFiles();
++            if (files == null) continue;
++            for (File file : files) {
++                if (!file.isFile()) continue;
++                String lower = file.getName().toLowerCase(Locale.ROOT);
++                if (lower.endsWith(".jar") || lower.endsWith(".zip")) out.add(file);
++            }
++        }
++        return out;
++    }
++
++    private static File findByName(List<File> mods, String fileName) {
++        for (File file : mods) {
++            if (file.getName().equalsIgnoreCase(fileName)) return file;
++        }
++        return null;
++    }
++
++    private static String displayName(File jar) {
++        String name = jar.getName();
++        int dot = name.lastIndexOf('.');
++        return dot > 0 ? name.substring(0, dot) : name;
++    }
++
++    private static List<String> readLines(File file) throws IOException {
++        List<String> lines = new ArrayList<>();
++        int total = 0;
++        try (BufferedReader reader = new BufferedReader(
++                new InputStreamReader(new FileInputStream(file), "UTF-8"))) {
++            String line;
++            while ((line = reader.readLine()) != null) {
++                lines.add(line);
++                total += line.length();
++                if (total > MAX_REPORT_CHARS) break;
++            }
++        }
++        return lines;
++    }
++}
+diff --git a/app_mojo/src/main/res/layout-land/fragment_launcher.xml b/app_mojo/src/main/res/layout-land/fragment_launcher.xml
+index 5c38149106bc5ab25edf38d4b8025171b57bf67d..f5701d57db3e4bf0b2b2b7d00055e97c6772925c 100644
+--- a/app_mojo/src/main/res/layout-land/fragment_launcher.xml
++++ b/app_mojo/src/main/res/layout-land/fragment_launcher.xml
+@@ -194,7 +194,7 @@
+ 						android:layout_width="wrap_content"
+ 						android:layout_height="wrap_content"
+ 						android:layout_marginTop="6dp"
+-						android:text="Share log"
++						android:text="Logs"
+ 						android:textColor="#FFFFFF"
+ 						android:textSize="14sp"
+ 						android:textStyle="bold" />
+diff --git a/app_mojo/src/main/res/layout/fragment_launcher.xml b/app_mojo/src/main/res/layout/fragment_launcher.xml
+index 7d5f5c30a9679d3a283e9523ee28c4e6a68c614d..1481fb91f563ca2dd1c2dc91db3a9723d026c4f8 100644
+--- a/app_mojo/src/main/res/layout/fragment_launcher.xml
++++ b/app_mojo/src/main/res/layout/fragment_launcher.xml
+@@ -175,7 +175,7 @@
+                     android:layout_width="wrap_content"
+                     android:layout_height="wrap_content"
+                     android:layout_marginTop="8dp"
+-                    android:text="Share log"
++                    android:text="Logs"
+                     android:textColor="#FFFFFF"
+                     android:textSize="14sp"
+                     android:textStyle="bold" />
