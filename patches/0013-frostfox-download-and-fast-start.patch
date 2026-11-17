@@ -1,0 +1,581 @@
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/LauncherActivity.java b/app_mojo/src/main/java/git/artdeell/mojo/LauncherActivity.java
+index 747f465a836d2eaf500d1b281271ddd22a9fbe02..3711da8fb5e0ada813f56b55b8803a6d86c2b21c 100644
+--- a/app_mojo/src/main/java/git/artdeell/mojo/LauncherActivity.java
++++ b/app_mojo/src/main/java/git/artdeell/mojo/LauncherActivity.java
+@@ -32,7 +32,7 @@ import git.artdeell.mojo.extra.ExtraListener;
+ import git.artdeell.mojo.fragments.MainMenuFragment;
+ import git.artdeell.mojo.fragments.MicrosoftLoginFragment;
+ import git.artdeell.mojo.fragments.SelectAuthFragment;
+-import git.artdeell.mojo.instances.ForgeAutoInstall;
++import git.artdeell.mojo.instances.FrostSetup;
+ import git.artdeell.mojo.instances.Instance;
+ import git.artdeell.mojo.instances.InstanceInstaller;
+ import git.artdeell.mojo.instances.Instances;
+@@ -110,8 +110,11 @@ public class LauncherActivity extends BaseActivity {
+             return false;
+         }
+ 
+-        if(selectedInstance.installer == null && ForgeAutoInstall.needed(selectedInstance)) {
+-            ForgeAutoInstall.install(selectedInstance);
++        FrostSetup.sPlayTime = System.currentTimeMillis();
++        if(FrostSetup.isRunning()) return false;
++        if(selectedInstance.installer == null && FrostSetup.needsSetup(selectedInstance)) {
++            // First run: the button says DOWNLOAD and everything is prepared with a progress bar
++            FrostSetup.start(this, selectedInstance);
+             return false;
+         }
+ 
+@@ -131,6 +134,12 @@ public class LauncherActivity extends BaseActivity {
+             return false;
+         }
+         String normalizedVersionId = MoJsonExtras.normalizeVersionId(selectedInstance.versionId);
++        java.io.File[] savedClasspath = FrostSetup.cachedClasspath(normalizedVersionId);
++        if(savedClasspath != null) {
++            // Everything is already downloaded: skip all file checks and start the game right away
++            new ContextAwareDoneListener(this, normalizedVersionId).onDownloadDone(savedClasspath);
++            return false;
++        }
+         JVersionList.Version mcVersion = MoJsonExtras.getListedVersion(normalizedVersionId);
+         new MoJsonDownloader().start(
+                 this.getAssets(),
+@@ -184,7 +193,6 @@ public class LauncherActivity extends BaseActivity {
+                     if(!isAllowed) Tools.runOnUiThread(() -> Toast.makeText(this, R.string.notification_permission_toast, Toast.LENGTH_LONG).show());
+                 }
+         );
+-        checkNotificationPermission();
+         if(LauncherPreferences.PREF_MIGRATION_NOTICE)
+             MojoApplication.sExecutorService.submit(this::checkPreviousInstalls);
+ 
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/fragments/MainMenuFragment.java b/app_mojo/src/main/java/git/artdeell/mojo/fragments/MainMenuFragment.java
+index e7dee377e7878748f3702471df5f27521bd4766e..923a59fce5bcf314fc9fcd34bcc62c54bce7465b 100644
+--- a/app_mojo/src/main/java/git/artdeell/mojo/fragments/MainMenuFragment.java
++++ b/app_mojo/src/main/java/git/artdeell/mojo/fragments/MainMenuFragment.java
+@@ -27,6 +27,7 @@ import git.artdeell.mojo.contracts.OpenDocumentWithExtension;
+ import git.artdeell.mojo.extra.ExtraConstants;
+ import git.artdeell.mojo.extra.ExtraCore;
+ import git.artdeell.mojo.instances.Instance;
++import git.artdeell.mojo.instances.FrostSetup;
+ import git.artdeell.mojo.instances.Instances;
+ import git.artdeell.mojo.utils.FileUtils;
+ 
+@@ -54,7 +55,7 @@ public class MainMenuFragment extends Fragment {
+         View mOpenDirectoryButton = view.findViewById(R.id.open_files_button);
+ 
+         ImageButton mEditProfileButton = view.findViewById(R.id.edit_profile_button);
+-        Button mPlayButton = view.findViewById(R.id.play_button);
++        mPlayButton = view.findViewById(R.id.play_button);
+         mVersionSpinner = view.findViewById(R.id.mc_version_spinner);
+ 
+         // FrostFox: gentle falling snow behind the home screen
+@@ -70,6 +71,9 @@ public class MainMenuFragment extends Fragment {
+         mEditProfileButton.setOnClickListener(v -> mVersionSpinner.openProfileEditor(requireActivity()));
+ 
+         mPlayButton.setOnClickListener(v -> ExtraCore.setValue(ExtraConstants.LAUNCH_GAME, true));
++        // FrostFox: the button says DOWNLOAD until the game has been set up once
++        FrostSetup.sListener = () -> Tools.runOnUiThread(this::updateDownloadLabel);
++        updateDownloadLabel();
+ 
+         // FrostFox: the Logs card opens the log viewer and crash reports
+         mShareLogsButton.setOnClickListener(v -> Tools.swapFragment(requireActivity(), LogsFragment.class, LogsFragment.TAG, null));
+@@ -97,10 +101,32 @@ public class MainMenuFragment extends Fragment {
+     public void onResume() {
+         super.onResume();
+         ExtraCore.setValue(ExtraConstants.REFRESH_ACCOUNT_SPINNER, true);
++        updateDownloadLabel();
+     }
+ 
+     private void runInstallerWithConfirmation() {
+         if(!ProgressLayout.ensureNoOngoingTasks(requireContext())) return;
+         mModInstallerLauncher.launch(null);
+     }
++
++    private Button mPlayButton;
++
++    private void updateDownloadLabel() {
++        Button button = mPlayButton;
++        if(button == null || !isAdded()) return;
++        if(FrostSetup.isRunning()) {
++            button.setText("DOWNLOADING...");
++            button.setEnabled(false);
++            return;
++        }
++        button.setEnabled(true);
++        button.setText(FrostSetup.needsSetup(Instances.loadSelectedInstance()) ? "DOWNLOAD" : getString(R.string.main_play));
++    }
++
++    @Override
++    public void onDestroyView() {
++        FrostSetup.sListener = null;
++        mPlayButton = null;
++        super.onDestroyView();
++    }
+ }
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/frost/ForgeInstallerReader.java b/app_mojo/src/main/java/git/artdeell/mojo/frost/ForgeInstallerReader.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..bb12c5209d639eb7871b58c5f603957493fc1f2d
+--- /dev/null
++++ b/app_mojo/src/main/java/git/artdeell/mojo/frost/ForgeInstallerReader.java
+@@ -0,0 +1,111 @@
++package git.artdeell.mojo.frost;
++
++import com.google.gson.JsonElement;
++import com.google.gson.JsonObject;
++import com.google.gson.JsonParser;
++
++import java.io.File;
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.InputStreamReader;
++import java.io.OutputStream;
++import java.util.zip.ZipEntry;
++import java.util.zip.ZipFile;
++
++/**
++ * FrostFox: reads a Forge 1.8.x installer jar without running its window.
++ * It takes the version description out of install_profile.json and copies the Forge
++ * universal jar to the place where the launcher expects its library. No Android classes are used.
++ */
++public final class ForgeInstallerReader {
++    /** The installer does not look the way this reader expects. The caller can fall back to the real installer. */
++    public static final class Unsupported extends IOException {
++        public Unsupported(String message) {
++            super(message);
++        }
++    }
++
++    public static final class Result {
++        public String versionId;
++        /** The complete version description to save as versions/&lt;id&gt;/&lt;id&gt;.json */
++        public String versionJson;
++        /** Where the universal jar was copied to, below the libraries folder. */
++        public File libraryFile;
++    }
++
++    private ForgeInstallerReader() {
++    }
++
++    public static Result read(File installerJar, File librariesRoot) throws IOException {
++        try (ZipFile zip = new ZipFile(installerJar)) {
++            ZipEntry profileEntry = zip.getEntry("install_profile.json");
++            if (profileEntry == null) throw new Unsupported("The installer has no install_profile.json");
++            JsonObject profile;
++            try (InputStream in = zip.getInputStream(profileEntry);
++                 InputStreamReader reader = new InputStreamReader(in, "UTF-8")) {
++                JsonElement element = new JsonParser().parse(reader);
++                if (!element.isJsonObject()) throw new Unsupported("install_profile.json is not an object");
++                profile = element.getAsJsonObject();
++            } catch (RuntimeException e) {
++                throw new Unsupported("install_profile.json is damaged: " + e.getMessage());
++            }
++            JsonObject install = object(profile, "install");
++            JsonObject versionInfo = object(profile, "versionInfo");
++            if (install == null || versionInfo == null) throw new Unsupported("The installer uses a newer layout");
++
++            String versionId = text(versionInfo, "id");
++            if (versionId == null) versionId = text(install, "target");
++            String coordinate = text(install, "path");
++            String filePath = text(install, "filePath");
++            if (versionId == null || coordinate == null || filePath == null) {
++                throw new Unsupported("The installer is missing version information");
++            }
++            if (!versionId.matches("[A-Za-z0-9._+-]+")) throw new Unsupported("Unexpected version id");
++
++            ZipEntry universal = zip.getEntry(filePath);
++            if (universal == null) throw new Unsupported("The installer does not contain " + filePath);
++            File target = new File(librariesRoot, relativeLibraryPath(coordinate));
++            File parent = target.getParentFile();
++            if (parent != null && !parent.isDirectory() && !parent.mkdirs()) {
++                throw new IOException("Could not create " + parent);
++            }
++            File partial = new File(target.getPath() + ".part");
++            try (InputStream in = zip.getInputStream(universal); OutputStream out = new FileOutputStream(partial)) {
++                byte[] buffer = new byte[16384];
++                int read;
++                while ((read = in.read(buffer)) != -1) out.write(buffer, 0, read);
++            }
++            if (target.exists() && !target.delete()) throw new IOException("Could not replace " + target);
++            if (!partial.renameTo(target)) throw new IOException("Could not move " + partial + " into place");
++
++            Result result = new Result();
++            result.versionId = versionId;
++            result.versionJson = versionInfo.toString();
++            result.libraryFile = target;
++            return result;
++        }
++    }
++
++    /** "group:artifact:version[:classifier]" becomes "group/path/artifact/version/artifact-version[-classifier].jar" */
++    static String relativeLibraryPath(String coordinate) throws Unsupported {
++        String[] parts = coordinate.split(":");
++        if (parts.length < 3 || parts.length > 4) throw new Unsupported("Unexpected library name " + coordinate);
++        for (String part : parts) {
++            if (!part.matches("[A-Za-z0-9._+-]+")) throw new Unsupported("Unexpected library name " + coordinate);
++        }
++        String group = parts[0].replace('.', '/');
++        String file = parts[1] + "-" + parts[2] + (parts.length == 4 ? "-" + parts[3] : "") + ".jar";
++        return group + "/" + parts[1] + "/" + parts[2] + "/" + file;
++    }
++
++    private static JsonObject object(JsonObject parent, String key) {
++        JsonElement element = parent.get(key);
++        return element != null && element.isJsonObject() ? element.getAsJsonObject() : null;
++    }
++
++    private static String text(JsonObject parent, String key) {
++        JsonElement element = parent.get(key);
++        return element != null && element.isJsonPrimitive() ? element.getAsString() : null;
++    }
++}
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/game/GameActivity.java b/app_mojo/src/main/java/git/artdeell/mojo/game/GameActivity.java
+index 246fd00bb9230e85fc04533b29efbc4af2867a4e..9c7ef3eca18d5a86b7ffdace066097175fcdf16e 100644
+--- a/app_mojo/src/main/java/git/artdeell/mojo/game/GameActivity.java
++++ b/app_mojo/src/main/java/git/artdeell/mojo/game/GameActivity.java
+@@ -108,6 +108,8 @@ public class GameActivity extends BaseActivity implements ControlButtonMenuListe
+     public ArrayAdapter<String> ingameControlsEditorArrayAdapter;
+     public AdapterView.OnItemClickListener ingameControlsEditorListener;
+     private GameService.LocalBinder mServiceBinder;
++    private static boolean sGameActive;
++    private static long sFrostPlayTime;
+ 
+     private QuickSettingSideDialog mQuickSettingSideDialog;
+ 
+@@ -133,9 +135,6 @@ public class GameActivity extends BaseActivity implements ControlButtonMenuListe
+         AsyncAssetManager.extractDefaultSettings(this, instance.getGameDirectory());
+         MCOptionUtils.load(instance.getGameDirectory().getAbsolutePath());
+ 
+-        Intent gameServiceIntent = new Intent(this, GameService.class);
+-        // Start the service a bit early
+-        ContextCompat.startForegroundService(this, gameServiceIntent);
+         initLayout(R.layout.activity_basemain);
+ 
+         Platform.initialize(this, launcherGLView);
+@@ -216,8 +215,9 @@ public class GameActivity extends BaseActivity implements ControlButtonMenuListe
+         // Set the activity for the executor. Must do this here, or else Tools.showErrorRemote() may not
+         // execute the correct method
+         ContextExecutor.setActivity(this);
+-        //Now, attach to the service. The game will only start when this happens, to make sure that we know the right state.
+-        bindService(gameServiceIntent, this, 0);
++        // FrostFox: there is no background service (and so no notification) any more; start the game view directly
++        launcherGLView.start(sGameActive);
++        sGameActive = true;
+     }
+ 
+     protected void initLayout(int resId) {
+@@ -240,6 +240,8 @@ public class GameActivity extends BaseActivity implements ControlButtonMenuListe
+             Bundle extras = Objects.requireNonNull(activityIntent.getExtras());
+             String version = extras.getString(INTENT_LAUNCH_VERSION);
+             File[] classpath = (File[]) extras.getSerializable(INTENT_LAUNCH_CLASSPATH);
++            sFrostPlayTime = extras.getLong("frost_play_time", 0);
++            if(sFrostPlayTime > 0) Logger.appendToLog("[FrostFox] Game screen opened " + (System.currentTimeMillis() - sFrostPlayTime) + " ms after Play");
+ 
+             activityIntent.removeExtra(INTENT_LAUNCH_VERSION);
+             activityIntent.removeExtra(INTENT_LAUNCH_CLASSPATH);
+@@ -411,11 +413,12 @@ public class GameActivity extends BaseActivity implements ControlButtonMenuListe
+ 
+     private void runCraft(String versionId, File[] classpath) throws Throwable {
+         Logger.appendToLog("--------- Starting game with Launcher Debug!");
++        if(sFrostPlayTime > 0) Logger.appendToLog("[FrostFox] Starting Java " + (System.currentTimeMillis() - sFrostPlayTime) + " ms after Play");
+         Tools.printLauncherInfo(versionId, instance.getLaunchArgs(), mGameRenderer.getCurrentRenderer(), instance.selectedRuntime, this);
+         JREUtils.redirectAndPrintJRELog();
+         GameRunner.launchGame(this, account, instance, versionId, classpath, mGameRenderer);
+         //Note that we actually stall in the above function, even if the game crashes. But let's be safe.
+-        Tools.runOnUiThread(()-> mServiceBinder.isActive = false);
++        Tools.runOnUiThread(()-> sGameActive = false);
+     }
+ 
+     private void dialogSendCustomKey() {
+@@ -524,6 +527,7 @@ public class GameActivity extends BaseActivity implements ControlButtonMenuListe
+ 
+     public void hideLoadingScreen(){
+         if(mLoadingScreen == null) return;
++        if(sFrostPlayTime > 0) Logger.appendToLog("[FrostFox] Game window ready " + (System.currentTimeMillis() - sFrostPlayTime) + " ms after Play");
+         ((TextView) mLoadingScreen.findViewById(R.id.main_loading_screen_text)).setText(getString(R.string.loading_screen_booted, PLATFORM.backendName()));
+         mLoadingScreen.animate()
+                 .alpha(0f)
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/instances/FrostSetup.java b/app_mojo/src/main/java/git/artdeell/mojo/instances/FrostSetup.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..e75fff6aa42feea611908c443585226b9b5a0e6e
+--- /dev/null
++++ b/app_mojo/src/main/java/git/artdeell/mojo/instances/FrostSetup.java
+@@ -0,0 +1,216 @@
++package git.artdeell.mojo.instances;
++
++import android.content.res.AssetManager;
++import android.util.Log;
++
++import com.kdt.mcgui.ProgressLayout;
++
++import git.artdeell.mojo.JVersionList;
++import git.artdeell.mojo.LauncherActivity;
++import git.artdeell.mojo.MojoApplication;
++import git.artdeell.mojo.R;
++import git.artdeell.mojo.Tools;
++import git.artdeell.mojo.frost.ForgeInstallerReader;
++import git.artdeell.mojo.modding.forge.ForgelikeUtils;
++import git.artdeell.mojo.progresskeeper.DownloaderProgressWrapper;
++import git.artdeell.mojo.tasks.mojson.MoJsonDownloader;
++import git.artdeell.mojo.tasks.mojson.MoJsonExtras;
++import git.artdeell.mojo.utils.DownloadUtils;
++
++import java.io.BufferedReader;
++import java.io.BufferedWriter;
++import java.io.File;
++import java.io.FileInputStream;
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.io.InputStreamReader;
++import java.io.OutputStreamWriter;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Locale;
++
++/**
++ * FrostFox: first-run setup and fast start.
++ *
++ * Setup ("DOWNLOAD" button): installs Forge without any installer window, then downloads the game
++ * files, and remembers the finished class path. After that, "PLAY" skips all download checks and
++ * starts the game straight away. If anything the launcher relies on goes missing, it falls back to
++ * the normal full check, which repairs it.
++ */
++public final class FrostSetup {
++    private static final String TAG = "FrostSetup";
++    private static final String CACHE_NAME = "frostfox_classpath.txt";
++
++    /** Time of the last tap on Play, passed on to the game process so startup can be timed. */
++    public static volatile long sPlayTime;
++    /** Called whenever the setup state changes (started, finished, failed). May run on any thread. */
++    public static volatile Runnable sListener;
++    private static volatile boolean sRunning;
++
++    private FrostSetup() {
++    }
++
++    public static boolean isRunning() {
++        return sRunning;
++    }
++
++    private static void notifyListener() {
++        Runnable listener = sListener;
++        if (listener != null) listener.run();
++    }
++
++    // ---------------------------------------------------------------- saved class path
++
++    private static File cacheFile(String versionId) {
++        return new File(MoJsonDownloader.createGameJsonPath(versionId).getParentFile(), CACHE_NAME);
++    }
++
++    /** The class path of a fully downloaded version, or null if anything it needs is missing. */
++    public static File[] cachedClasspath(String versionId) {
++        if (versionId == null) return null;
++        File cache = cacheFile(versionId);
++        if (!cache.isFile()) return null;
++        try (BufferedReader reader = new BufferedReader(new InputStreamReader(new FileInputStream(cache), "UTF-8"))) {
++            boolean needsNatives = "natives=1".equals(reader.readLine());
++            List<File> files = new ArrayList<>();
++            String line;
++            while ((line = reader.readLine()) != null) {
++                if (line.isEmpty()) continue;
++                File file = new File(line);
++                if (!file.isFile()) return null;
++                files.add(file);
++            }
++            if (files.isEmpty()) return null;
++            if (needsNatives) {
++                String[] natives = new File(Tools.DIR_CACHE, "natives/" + versionId).list();
++                if (natives == null || natives.length == 0) return null;
++            }
++            return files.toArray(new File[0]);
++        } catch (IOException e) {
++            return null;
++        }
++    }
++
++    private static void saveClasspath(String versionId, File[] classpath) throws IOException {
++        String[] natives = new File(Tools.DIR_CACHE, "natives/" + versionId).list();
++        File cache = cacheFile(versionId);
++        File partial = new File(cache.getPath() + ".part");
++        try (BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(new FileOutputStream(partial), "UTF-8"))) {
++            writer.write(natives != null && natives.length > 0 ? "natives=1" : "natives=0");
++            writer.write('\n');
++            for (File file : classpath) {
++                writer.write(file.getAbsolutePath());
++                writer.write('\n');
++            }
++        }
++        if (cache.exists() && !cache.delete()) throw new IOException("Could not replace " + cache);
++        if (!partial.renameTo(cache)) throw new IOException("Could not save " + cache);
++    }
++
++    // ---------------------------------------------------------------- state
++
++    /** True if this instance still has to be downloaded (the button then says DOWNLOAD). */
++    public static boolean needsSetup(Instance instance) {
++        if (instance == null || !instance.autoForge) return false;
++        String id = instance.versionId;
++        if (id == null || !id.toLowerCase(Locale.ROOT).contains("forge")) return true;
++        return cachedClasspath(MoJsonExtras.normalizeVersionId(id)) == null;
++    }
++
++    // ---------------------------------------------------------------- setup
++
++    public static void start(LauncherActivity activity, Instance instance) {
++        if (sRunning) return;
++        sRunning = true;
++        notifyListener();
++        final AssetManager assets = activity.getAssets();
++        ProgressLayout.setProgress(ProgressLayout.INSTANCE_INSTALL, 0);
++        MojoApplication.sExecutorService.execute(() -> {
++            try {
++                String versionId = ensureForge(instance);
++                ProgressLayout.clearProgress(ProgressLayout.INSTANCE_INSTALL);
++                final String normalized = MoJsonExtras.normalizeVersionId(versionId);
++                JVersionList.Version listed = MoJsonExtras.getListedVersion(normalized);
++                new MoJsonDownloader().start(assets, listed, normalized, new MoJsonExtras.DoneListener() {
++                    @Override
++                    public void onDownloadDone(File[] classpath) {
++                        try {
++                            saveClasspath(normalized, classpath);
++                        } catch (IOException e) {
++                            Log.w(TAG, "Could not save the class path", e);
++                        }
++                        finish(null);
++                    }
++
++                    @Override
++                    public void onDownloadFailed(Throwable throwable) {
++                        finish(throwable);
++                    }
++                });
++            } catch (ForgeInstallerReader.Unsupported e) {
++                ProgressLayout.clearProgress(ProgressLayout.INSTANCE_INSTALL);
++                Log.w(TAG, "Falling back to the Forge installer window: " + e.getMessage());
++                fallBackToInstaller(instance);
++            } catch (Exception e) {
++                ProgressLayout.clearProgress(ProgressLayout.INSTANCE_INSTALL);
++                finish(e);
++            }
++        });
++    }
++
++    private static void finish(Throwable error) {
++        sRunning = false;
++        if (error != null) Tools.showErrorRemote("The download failed", error);
++        notifyListener();
++    }
++
++    /** Installs Forge quietly. Returns the Forge version id the instance now uses. */
++    private static String ensureForge(Instance instance) throws IOException {
++        String current = instance.versionId;
++        if (current != null && current.toLowerCase(Locale.ROOT).contains("forge")
++                && MoJsonDownloader.createGameJsonPath(current).isFile()) {
++            return current; // Forge is already installed
++        }
++
++        final InstanceInstaller info = ForgelikeUtils.FORGE_UTILS.createInstaller(ForgeAutoInstall.FORGE_VERSION);
++        final File jar = new File(info.installerJar);
++        final byte[] buffer = new byte[8192];
++        final DownloaderProgressWrapper wrapper = new DownloaderProgressWrapper(
++                R.string.mcl_launch_downloading_progress, ProgressLayout.INSTANCE_INSTALL);
++        wrapper.extraString = "Forge";
++        DownloadUtils.ensureSha1(jar, info.installerSha1, () ->
++                DownloadUtils.downloadFileMonitored(info.installerDownloadUrl, jar, buffer, wrapper));
++
++        try {
++            ForgeInstallerReader.Result result = ForgeInstallerReader.read(jar, new File(Tools.DIR_HOME_LIBRARY));
++            File jsonFile = MoJsonDownloader.createGameJsonPath(result.versionId);
++            File parent = jsonFile.getParentFile();
++            if (parent != null && !parent.isDirectory() && !parent.mkdirs()) {
++                throw new IOException("Could not create " + parent);
++            }
++            try (BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(new FileOutputStream(jsonFile), "UTF-8"))) {
++                writer.write(result.versionJson);
++            }
++            instance.versionId = result.versionId;
++            instance.installer = null;
++            instance.write();
++            return result.versionId;
++        } finally {
++            //noinspection ResultOfMethodCallIgnored
++            jar.delete();
++        }
++    }
++
++    /** Last resort: the old installer window, if the installer is not shaped as expected. */
++    private static void fallBackToInstaller(Instance instance) {
++        try {
++            InstanceInstaller installer = ForgelikeUtils.FORGE_UTILS.createInstaller(ForgeAutoInstall.FORGE_VERSION);
++            instance.installer = installer;
++            instance.write();
++            installer.start();
++            finish(null);
++        } catch (Exception e) {
++            finish(e);
++        }
++    }
++}
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/services/ProgressServiceKeeper.java b/app_mojo/src/main/java/git/artdeell/mojo/services/ProgressServiceKeeper.java
+index 131e73663f5f8cc51046afdfca14fdb0227a8018..9bb6a33583fc6ea10737bb676ab67d3a01d857bd 100644
+--- a/app_mojo/src/main/java/git/artdeell/mojo/services/ProgressServiceKeeper.java
++++ b/app_mojo/src/main/java/git/artdeell/mojo/services/ProgressServiceKeeper.java
+@@ -12,7 +12,7 @@ public class ProgressServiceKeeper implements TaskCountListener {
+ 
+     @Override
+     public boolean onUpdateTaskCount(int taskCount) {
+-        if(taskCount > 0) ProgressService.startService(context);
++        // FrostFox: no background service and no notification while tasks run
+         return false;
+     }
+ }
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/utils/jre/JavaRunner.java b/app_mojo/src/main/java/git/artdeell/mojo/utils/jre/JavaRunner.java
+index 6774ccf778b78f821505a5530084de767934b8fc..606582431008d5c265d65b43f07baabd6ac43056 100644
+--- a/app_mojo/src/main/java/git/artdeell/mojo/utils/jre/JavaRunner.java
++++ b/app_mojo/src/main/java/git/artdeell/mojo/utils/jre/JavaRunner.java
+@@ -97,6 +97,10 @@ public class JavaRunner {
+ 
+         userArguments.add(0, "-Xms"+LauncherPreferences.PREF_RAM_ALLOCATION+"M");
+         userArguments.add(0, "-Xmx"+LauncherPreferences.PREF_RAM_ALLOCATION+"M");
++        // FrostFox: skip the byte-code check of game and mod classes (a large part of startup time),
++        // and ignore System.gc() calls from the game and mods (they cause long freezes on phones)
++        addFlagUnlessPresent(userArguments, "-XX:-BytecodeVerificationRemote", "-XX:+BytecodeVerificationRemote", "-Xverify", "-noverify");
++        addFlagUnlessPresent(userArguments, "-XX:+DisableExplicitGC", "-XX:-DisableExplicitGC");
+ 
+         ArrayList<String> overridableArguments = new ArrayList<>(Arrays.asList(
+                 "-Djava.home=" + runtimeHome,
+@@ -123,6 +127,8 @@ public class JavaRunner {
+                 "-Dlog4j2.formatMsgNoLookups=true", //Log4j RCE mitigation
+                 "-Dfml.earlyprogresswindow=false", //Forge 1.14+ workaround
+                 "-Dloader.disable_forked_guis=true",
++                "-Dfml.ignoreInvalidMinecraftCertificates=true", // FrostFox: skip the jar signature check
++                "-Dfml.ignorePatchDiscrepancies=true",
+                 "-Djdk.lang.Process.launchMechanism=FORK" // Default is POSIX_SPAWN which requires starting jspawnhelper, which doesn't work on Android
+         ));
+         List<String> additionalArguments = new ArrayList<>();
+@@ -146,6 +152,14 @@ public class JavaRunner {
+         return userArguments;
+     }
+ 
++    private static void addFlagUnlessPresent(List<String> arguments, String flag, String... conflicts) {
++        for(String argument : arguments) {
++            if(argument.equals(flag)) return;
++            for(String conflict : conflicts) if(argument.startsWith(conflict)) return;
++        }
++        arguments.add(0, flag);
++    }
++
+     private static File getVmPath(File runtimeHomeDir, String arch, String flavor) {
+         if(arch != null) return new File(runtimeHomeDir, "lib/"+arch+"/"+flavor+"/libjvm.so");
+         else return new File(runtimeHomeDir, "lib/"+flavor+"/libjvm.so");
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/utils/lifecycle/ContextAwareDoneListener.java b/app_mojo/src/main/java/git/artdeell/mojo/utils/lifecycle/ContextAwareDoneListener.java
+index 3fe4a555c1502f8f58d90404dc9377df588e7b40..070cb518fa91a1cfbfd2096a55481ca153f9da76 100644
+--- a/app_mojo/src/main/java/git/artdeell/mojo/utils/lifecycle/ContextAwareDoneListener.java
++++ b/app_mojo/src/main/java/git/artdeell/mojo/utils/lifecycle/ContextAwareDoneListener.java
+@@ -30,6 +30,7 @@ public class ContextAwareDoneListener implements MoJsonExtras.DoneListener, Cont
+         Intent mainIntent = new Intent(context, GameActivity.class);
+         mainIntent.putExtra(INTENT_LAUNCH_VERSION, mNormalizedVersionid);
+         mainIntent.putExtra(INTENT_LAUNCH_CLASSPATH, classpath);
++        mainIntent.putExtra("frost_play_time", git.artdeell.mojo.instances.FrostSetup.sPlayTime);
+         mainIntent.addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP);
+         return mainIntent;
+     }
