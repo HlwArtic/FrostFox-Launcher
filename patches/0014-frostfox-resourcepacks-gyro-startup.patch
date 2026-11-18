@@ -1,0 +1,3226 @@
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/Tools.java b/app_mojo/src/main/java/git/artdeell/mojo/Tools.java
+index b7bed57f33696d873d3c2335d0232af7c35cb768..b8f922d66e38c19d02d3bade26ee88facf2ec6ea 100644
+--- a/app_mojo/src/main/java/git/artdeell/mojo/Tools.java
++++ b/app_mojo/src/main/java/git/artdeell/mojo/Tools.java
+@@ -126,7 +126,14 @@ public final class Tools {
+ 
+     private static @Nullable File getAppStorageRoot(Context ctx) {
+         if(SDK_INT >= 29) {
+-            return ctx.getExternalFilesDir(null);
++            // FrostFox: new installs keep the game on the phone's fast internal storage, which is much quicker than
++            // the app folder on shared storage when thousands of small files are read at startup.
++            // Existing installs stay where their files already are.
++            File external = ctx.getExternalFilesDir(null);
++            if(external != null && new File(external, ".minecraft").exists()) return external;
++            File internal = new File(ctx.getFilesDir(), "frostfox");
++            if(!internal.isDirectory() && !internal.mkdirs()) return external;
++            return internal;
+         }
+         File externalStorageDirectory = Environment.getExternalStorageDirectory();
+         if(externalStorageDirectory == null) return null;
+@@ -868,11 +875,6 @@ public final class Tools {
+         return weakReference.get();
+     }
+ 
+-    public static boolean deviceSupportsGyro(@NonNull Context context) {
+-        return ((SensorManager)context.getSystemService(Context.SENSOR_SERVICE)).getDefaultSensor(Sensor.TYPE_GYROSCOPE) != null;
+-
+-    }
+-
+     public static void dialogForceClose(Context ctx) {
+         new android.app.AlertDialog.Builder(ctx)
+                 .setMessage(R.string.mcn_exit_confirm)
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/fragments/MainMenuFragment.java b/app_mojo/src/main/java/git/artdeell/mojo/fragments/MainMenuFragment.java
+index 923a59fce5bcf314fc9fcd34bcc62c54bce7465b..d55166cbcc6ba9b50c7511c3b857b94c1f924696 100644
+--- a/app_mojo/src/main/java/git/artdeell/mojo/fragments/MainMenuFragment.java
++++ b/app_mojo/src/main/java/git/artdeell/mojo/fragments/MainMenuFragment.java
+@@ -53,6 +53,7 @@ public class MainMenuFragment extends Fragment {
+         View mInstallJarButton = view.findViewById(R.id.install_jar_button);
+         View mShareLogsButton = view.findViewById(R.id.share_logs_button);
+         View mOpenDirectoryButton = view.findViewById(R.id.open_files_button);
++        View mResourcePacksButton = view.findViewById(R.id.resource_packs_button);
+ 
+         ImageButton mEditProfileButton = view.findViewById(R.id.edit_profile_button);
+         mPlayButton = view.findViewById(R.id.play_button);
+@@ -68,6 +69,7 @@ public class MainMenuFragment extends Fragment {
+         mCustomControlButton.setOnClickListener(v -> startActivity(new Intent(requireContext(), CustomControlsActivity.class)));
+         // FrostFox: the Mods card opens the Mods screen
+         mInstallJarButton.setOnClickListener(v -> Tools.swapFragment(requireActivity(), ModsFragment.class, ModsFragment.TAG, null));
++        mResourcePacksButton.setOnClickListener(v -> Tools.swapFragment(requireActivity(), ResourcePacksFragment.class, ResourcePacksFragment.TAG, null));
+         mEditProfileButton.setOnClickListener(v -> mVersionSpinner.openProfileEditor(requireActivity()));
+ 
+         mPlayButton.setOnClickListener(v -> ExtraCore.setValue(ExtraConstants.LAUNCH_GAME, true));
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/fragments/ResourcePacksFragment.java b/app_mojo/src/main/java/git/artdeell/mojo/fragments/ResourcePacksFragment.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..1ffa48e30310620e188d2eb242a2fe2b85d9310f
+--- /dev/null
++++ b/app_mojo/src/main/java/git/artdeell/mojo/fragments/ResourcePacksFragment.java
+@@ -0,0 +1,432 @@
++package git.artdeell.mojo.fragments;
++
++import android.content.ContentResolver;
++import android.database.Cursor;
++import android.graphics.Typeface;
++import android.net.Uri;
++import android.os.Bundle;
++import android.provider.OpenableColumns;
++import android.view.Gravity;
++import android.view.LayoutInflater;
++import android.view.View;
++import android.view.ViewGroup;
++import android.widget.BaseAdapter;
++import android.widget.Button;
++import android.widget.LinearLayout;
++import android.widget.ListView;
++import android.widget.TextView;
++import android.widget.Toast;
++
++import androidx.activity.result.ActivityResultLauncher;
++import androidx.activity.result.contract.ActivityResultContracts;
++import androidx.annotation.NonNull;
++import androidx.annotation.Nullable;
++import androidx.appcompat.widget.SwitchCompat;
++import androidx.fragment.app.Fragment;
++
++import com.google.gson.JsonArray;
++import com.google.gson.JsonElement;
++import com.google.gson.JsonObject;
++import com.google.gson.JsonParser;
++
++import git.artdeell.mojo.MojoApplication;
++import git.artdeell.mojo.Tools;
++import git.artdeell.mojo.instances.Instance;
++import git.artdeell.mojo.instances.Instances;
++
++import java.io.BufferedReader;
++import java.io.BufferedWriter;
++import java.io.File;
++import java.io.FileInputStream;
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.InputStreamReader;
++import java.io.OutputStream;
++import java.io.OutputStreamWriter;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.List;
++import java.util.Locale;
++import java.util.zip.ZipEntry;
++import java.util.zip.ZipFile;
++
++/**
++ * FrostFox: resource packs with an ON/OFF switch each. "On" means the pack is used by the game:
++ * it is listed in the instance's options.txt, exactly as if it had been selected in the game's own
++ * resource pack screen. Nothing is ever deleted. Changes apply the next time the game starts.
++ */
++public class ResourcePacksFragment extends Fragment {
++    public static final String TAG = "ResourcePacksFragment";
++    private static final String OPTION_KEY = "resourcePacks:";
++
++    private static class PackEntry {
++        File file;
++        String name;
++        String detail;
++        boolean enabled;
++    }
++
++    private final List<PackEntry> mPacks = new ArrayList<>();
++    private File mPackDir;
++    private File mOptionsFile;
++    private TextView mSummary;
++    private TextView mEmpty;
++    private PackAdapter mAdapter;
++
++    private final ActivityResultLauncher<String[]> mPicker = registerForActivityResult(
++            new ActivityResultContracts.OpenMultipleDocuments(), this::onFilesPicked);
++
++    @Nullable
++    @Override
++    public View onCreateView(@NonNull LayoutInflater inflater, @Nullable ViewGroup container,
++                             @Nullable Bundle savedInstanceState) {
++        int pad = (int) Tools.dpToPx(16);
++        int gap = (int) Tools.dpToPx(8);
++
++        LinearLayout root = new LinearLayout(requireContext());
++        root.setOrientation(LinearLayout.VERTICAL);
++        root.setPadding(pad, pad, pad, pad);
++
++        TextView title = new TextView(requireContext());
++        title.setText("Resource packs");
++        title.setTextSize(22);
++        title.setTypeface(Typeface.DEFAULT_BOLD);
++        root.addView(title);
++
++        mSummary = new TextView(requireContext());
++        mSummary.setAlpha(0.7f);
++        root.addView(mSummary);
++
++        TextView hint = new TextView(requireContext());
++        hint.setText("Packs that are on are used the next time you start the game. "
++                + "A pack you turn on goes on top of the others.");
++        hint.setAlpha(0.7f);
++        hint.setPadding(0, 0, 0, gap);
++        root.addView(hint);
++
++        LinearLayout buttons = new LinearLayout(requireContext());
++        buttons.setOrientation(LinearLayout.HORIZONTAL);
++        buttons.addView(makeButton("Add pack", v -> mPicker.launch(new String[]{"*/*"})));
++        buttons.addView(makeButton("All off", v -> allOff()));
++        root.addView(buttons);
++
++        mEmpty = new TextView(requireContext());
++        mEmpty.setText("No resource packs yet. Tap \"Add pack\" and choose a .zip file.");
++        mEmpty.setGravity(Gravity.CENTER);
++        mEmpty.setPadding(pad, pad * 2, pad, pad);
++        mEmpty.setVisibility(View.GONE);
++        root.addView(mEmpty);
++
++        ListView list = new ListView(requireContext());
++        mAdapter = new PackAdapter();
++        list.setAdapter(mAdapter);
++        list.setDividerHeight(0);
++        root.addView(list, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
++        return root;
++    }
++
++    private Button makeButton(String text, View.OnClickListener listener) {
++        Button button = new Button(requireContext());
++        button.setText(text);
++        button.setAllCaps(false);
++        button.setOnClickListener(listener);
++        button.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
++        return button;
++    }
++
++    @Override
++    public void onViewCreated(@NonNull View view, @Nullable Bundle savedInstanceState) {
++        Instance instance = Instances.loadSelectedInstance();
++        if (instance == null) {
++            Toast.makeText(requireContext(), "No instance selected", Toast.LENGTH_LONG).show();
++            getParentFragmentManager().popBackStack();
++            return;
++        }
++        File gameDir = instance.getGameDirectory();
++        mPackDir = new File(gameDir, "resourcepacks");
++        mOptionsFile = new File(gameDir, "options.txt");
++        reload();
++    }
++
++    // ---------- scanning ----------
++
++    private void reload() {
++        final File packDir = mPackDir;
++        final File optionsFile = mOptionsFile;
++        MojoApplication.sExecutorService.execute(() -> {
++            List<String> enabledNames = readEnabledNames(optionsFile);
++            List<PackEntry> found = new ArrayList<>();
++            File[] files = packDir.listFiles();
++            if (files != null) {
++                for (File file : files) {
++                    boolean zip = file.isFile() && file.getName().toLowerCase(Locale.ROOT).endsWith(".zip");
++                    boolean folder = file.isDirectory() && new File(file, "pack.mcmeta").isFile();
++                    if (!zip && !folder) continue;
++                    PackEntry entry = new PackEntry();
++                    entry.file = file;
++                    entry.name = zip ? file.getName().substring(0, file.getName().length() - 4) : file.getName();
++                    entry.enabled = enabledNames.contains(file.getName());
++                    String description = readDescription(file, zip);
++                    String size = zip ? humanSize(file.length()) : "folder";
++                    entry.detail = description != null && !description.isEmpty() ? description + "  -  " + size : size;
++                    found.add(entry);
++                }
++            }
++            Collections.sort(found, (a, b) -> a.name.compareToIgnoreCase(b.name));
++            Tools.runOnUiThread(() -> {
++                if (!isAdded()) return;
++                mPacks.clear();
++                mPacks.addAll(found);
++                refreshViews();
++            });
++        });
++    }
++
++    private static String humanSize(long bytes) {
++        if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)) + " MB";
++        return Math.max(1, bytes / 1024) + " KB";
++    }
++
++    /** Reads the short description from pack.mcmeta, if there is one. */
++    private static String readDescription(File pack, boolean zip) {
++        try {
++            InputStream in;
++            ZipFile zipFile = null;
++            if (zip) {
++                zipFile = new ZipFile(pack);
++                ZipEntry entry = zipFile.getEntry("pack.mcmeta");
++                if (entry == null) {
++                    zipFile.close();
++                    return null;
++                }
++                in = zipFile.getInputStream(entry);
++            } else {
++                in = new FileInputStream(new File(pack, "pack.mcmeta"));
++            }
++            try (InputStream stream = in; InputStreamReader reader = new InputStreamReader(stream, "UTF-8")) {
++                JsonElement root = new JsonParser().parse(reader);
++                if (!root.isJsonObject()) return null;
++                JsonObject packObject = root.getAsJsonObject().has("pack") && root.getAsJsonObject().get("pack").isJsonObject()
++                        ? root.getAsJsonObject().getAsJsonObject("pack") : null;
++                if (packObject == null || !packObject.has("description") || !packObject.get("description").isJsonPrimitive()) return null;
++                String description = packObject.get("description").getAsString().replaceAll("\u00a7.", "").replace('\n', ' ').trim();
++                return description.length() > 70 ? description.substring(0, 70) + "..." : description;
++            } finally {
++                if (zipFile != null) zipFile.close();
++            }
++        } catch (Exception ignored) {
++            return null;
++        }
++    }
++
++    // ---------- options.txt ----------
++
++    private static List<String> readEnabledNames(File options) {
++        List<String> names = new ArrayList<>();
++        if (!options.isFile()) return names;
++        try (BufferedReader reader = new BufferedReader(new InputStreamReader(new FileInputStream(options), "UTF-8"))) {
++            String line;
++            while ((line = reader.readLine()) != null) {
++                if (!line.startsWith(OPTION_KEY)) continue;
++                JsonElement value = new JsonParser().parse(line.substring(OPTION_KEY.length()));
++                if (value.isJsonArray()) {
++                    for (JsonElement item : value.getAsJsonArray()) {
++                        if (item.isJsonPrimitive()) names.add(item.getAsString());
++                    }
++                }
++                break;
++            }
++        } catch (Exception ignored) {
++            // An unreadable options file counts as "nothing is on"
++        }
++        return names;
++    }
++
++    private static void writeEnabledNames(File options, List<String> names) throws IOException {
++        List<String> lines = new ArrayList<>();
++        if (options.isFile()) {
++            try (BufferedReader reader = new BufferedReader(new InputStreamReader(new FileInputStream(options), "UTF-8"))) {
++                String line;
++                while ((line = reader.readLine()) != null) lines.add(line);
++            }
++        }
++        JsonArray array = new JsonArray();
++        for (String name : names) array.add(name);
++        String newLine = OPTION_KEY + array.toString();
++        boolean replaced = false;
++        for (int i = 0; i < lines.size(); i++) {
++            if (lines.get(i).startsWith(OPTION_KEY)) {
++                lines.set(i, newLine);
++                replaced = true;
++                break;
++            }
++        }
++        if (!replaced) lines.add(newLine);
++        File parent = options.getParentFile();
++        if (parent != null && !parent.isDirectory() && !parent.mkdirs()) throw new IOException("Cannot create " + parent);
++        try (BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(new FileOutputStream(options), "UTF-8"))) {
++            for (String line : lines) {
++                writer.write(line);
++                writer.write('\n');
++            }
++        }
++    }
++
++    // ---------- toggling ----------
++
++    private boolean setEnabled(PackEntry entry, boolean enable) {
++        List<String> names = readEnabledNames(mOptionsFile);
++        names.remove(entry.file.getName());
++        if (enable) names.add(entry.file.getName());
++        try {
++            writeEnabledNames(mOptionsFile, names);
++        } catch (IOException e) {
++            Toast.makeText(requireContext(), "Could not change " + entry.name, Toast.LENGTH_LONG).show();
++            return false;
++        }
++        entry.enabled = enable;
++        return true;
++    }
++
++    private void allOff() {
++        List<String> names = readEnabledNames(mOptionsFile);
++        for (PackEntry entry : mPacks) names.remove(entry.file.getName());
++        try {
++            writeEnabledNames(mOptionsFile, names);
++            for (PackEntry entry : mPacks) entry.enabled = false;
++        } catch (IOException e) {
++            Toast.makeText(requireContext(), "Could not change the packs", Toast.LENGTH_LONG).show();
++        }
++        refreshViews();
++    }
++
++    private void refreshViews() {
++        int on = 0;
++        for (PackEntry entry : mPacks) if (entry.enabled) on++;
++        mSummary.setText(mPacks.size() + " packs, " + on + " on");
++        mEmpty.setVisibility(mPacks.isEmpty() ? View.VISIBLE : View.GONE);
++        mAdapter.notifyDataSetChanged();
++    }
++
++    // ---------- adding ----------
++
++    private void onFilesPicked(List<Uri> uris) {
++        if (uris == null || uris.isEmpty()) return;
++        final ContentResolver resolver = requireContext().getContentResolver();
++        final File packDir = mPackDir;
++        MojoApplication.sExecutorService.execute(() -> {
++            int added = 0, skipped = 0;
++            if (!packDir.isDirectory() && !packDir.mkdirs()) skipped = uris.size();
++            else {
++                for (Uri uri : uris) {
++                    String name = displayName(resolver, uri);
++                    if (name == null || !name.toLowerCase(Locale.ROOT).endsWith(".zip")) {
++                        skipped++;
++                        continue;
++                    }
++                    File target = new File(packDir, new File(name).getName());
++                    if (target.exists()) {
++                        skipped++;
++                        continue;
++                    }
++                    try {
++                        copy(resolver, uri, target);
++                        added++;
++                    } catch (IOException e) {
++                        //noinspection ResultOfMethodCallIgnored
++                        target.delete();
++                        skipped++;
++                    }
++                }
++            }
++            final int addedFinal = added, skippedFinal = skipped;
++            Tools.runOnUiThread(() -> {
++                if (!isAdded()) return;
++                String message = addedFinal + " added";
++                if (skippedFinal > 0) message += ", " + skippedFinal + " skipped (not a .zip, or already there)";
++                Toast.makeText(requireContext(), message, Toast.LENGTH_LONG).show();
++                reload();
++            });
++        });
++    }
++
++    private static String displayName(ContentResolver resolver, Uri uri) {
++        try (Cursor cursor = resolver.query(uri, new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null)) {
++            if (cursor != null && cursor.moveToFirst()) return cursor.getString(0);
++        } catch (Exception ignored) {
++        }
++        return uri.getLastPathSegment();
++    }
++
++    private static void copy(ContentResolver resolver, Uri uri, File target) throws IOException {
++        try (InputStream in = resolver.openInputStream(uri)) {
++            if (in == null) throw new IOException("Cannot open " + uri);
++            try (OutputStream out = new FileOutputStream(target)) {
++                byte[] buffer = new byte[16384];
++                int read;
++                while ((read = in.read(buffer)) != -1) out.write(buffer, 0, read);
++            }
++        }
++    }
++
++    // ---------- list rows ----------
++
++    private class PackAdapter extends BaseAdapter {
++        @Override public int getCount() { return mPacks.size(); }
++        @Override public Object getItem(int position) { return mPacks.get(position); }
++        @Override public long getItemId(int position) { return position; }
++
++        @Override
++        public View getView(int position, View convertView, ViewGroup parent) {
++            LinearLayout row;
++            TextView nameView, detailView;
++            SwitchCompat toggle;
++            if (convertView == null) {
++                int pad = (int) Tools.dpToPx(12);
++                row = new LinearLayout(parent.getContext());
++                row.setOrientation(LinearLayout.HORIZONTAL);
++                row.setGravity(Gravity.CENTER_VERTICAL);
++                row.setPadding(0, pad, 0, pad);
++
++                LinearLayout texts = new LinearLayout(parent.getContext());
++                texts.setOrientation(LinearLayout.VERTICAL);
++                nameView = new TextView(parent.getContext());
++                nameView.setTextSize(16);
++                nameView.setTag("name");
++                detailView = new TextView(parent.getContext());
++                detailView.setTextSize(12);
++                detailView.setAlpha(0.7f);
++                detailView.setTag("detail");
++                texts.addView(nameView);
++                texts.addView(detailView);
++                row.addView(texts, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
++
++                toggle = new SwitchCompat(parent.getContext());
++                toggle.setTag("toggle");
++                row.addView(toggle);
++            } else {
++                row = (LinearLayout) convertView;
++                nameView = row.findViewWithTag("name");
++                detailView = row.findViewWithTag("detail");
++                toggle = row.findViewWithTag("toggle");
++            }
++
++            final PackEntry entry = mPacks.get(position);
++            nameView.setText(entry.name);
++            detailView.setText(entry.detail);
++            nameView.setAlpha(entry.enabled ? 1f : 0.5f);
++
++            toggle.setOnCheckedChangeListener(null);
++            toggle.setChecked(entry.enabled);
++            toggle.setOnCheckedChangeListener((button, checked) -> {
++                if (!setEnabled(entry, checked)) {
++                    button.setOnCheckedChangeListener(null);
++                    button.setChecked(entry.enabled);
++                }
++                refreshViews();
++            });
++            return row;
++        }
++    }
++}
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/frost/SnowView.java b/app_mojo/src/main/java/git/artdeell/mojo/frost/SnowView.java
+index 03278e9812c0f7eb2a6de571933503b9b869c2c8..f89039c318d4476a2dbd7632328852c353a402d4 100644
+--- a/app_mojo/src/main/java/git/artdeell/mojo/frost/SnowView.java
++++ b/app_mojo/src/main/java/git/artdeell/mojo/frost/SnowView.java
+@@ -1,42 +1,43 @@
+ package git.artdeell.mojo.frost;
+ 
+-import android.app.ActivityManager;
+ import android.content.Context;
+ import android.graphics.Canvas;
+ import android.graphics.Paint;
+-import android.os.PowerManager;
+-import android.os.SystemClock;
+-import android.provider.Settings;
+ import android.util.AttributeSet;
+ import android.view.View;
+ 
+-import git.artdeell.mojo.prefs.LauncherPreferences;
+-
+ import java.util.Random;
+ 
+ /**
+- * FrostFox: a few dozen small square snowflakes falling slowly behind the home screen.
+- * Drawn in code (no image files), runs at about 20 frames per second, and stops completely when
+- * the view is hidden, the app is in the background, battery saver is on, the system's
+- * "remove animations" setting is on, or the user switched it off.
++ * FrostFox: a still, detailed snow backdrop for the home screen. It is drawn once and never
++ * animated, so it costs no CPU or battery while you look at it, and it does not exist at all
++ * in the game (the game runs in its own process). Flakes come in four pixel-art shapes.
+  */
+ public class SnowView extends View {
+-    public static final String PREF_KEY = "frostfoxSnow";
+-
+-    private static final int FLAKES = 36;
+-    private static final long FRAME_MS = 50L;
++    private static final String[] BIG = {   // six-armed crystal
++            "...#...",
++            ".#.#.#.",
++            "..###..",
++            "#######",
++            "..###..",
++            ".#.#.#.",
++            "...#...",
++    };
++    private static final String[] STAR = {  // X-shaped flake
++            "#...#",
++            ".#.#.",
++            "..#..",
++            ".#.#.",
++            "#...#",
++    };
++    private static final String[] PLUS = {
++            ".#.",
++            "###",
++            ".#.",
++    };
++    private static final String[] DOT = {"#"};
+ 
+     private final Paint mPaint = new Paint();
+-    private final Random mRandom = new Random();
+-    private final float[] mX = new float[FLAKES];
+-    private final float[] mY = new float[FLAKES];
+-    private final float[] mSpeed = new float[FLAKES];
+-    private final float[] mDrift = new float[FLAKES];
+-    private final int[] mSize = new int[FLAKES];
+-    private final Runnable mFrame = this::invalidate;
+-
+-    private boolean mAnimating;
+-    private long mLastFrame;
+ 
+     public SnowView(Context context) {
+         this(context, null);
+@@ -47,115 +48,43 @@ public class SnowView extends View {
+         setWillNotDraw(false);
+         setClickable(false);
+         setFocusable(false);
++        setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO);
+         mPaint.setAntiAlias(false);
+         mPaint.setStyle(Paint.Style.FILL);
+     }
+ 
+-    /** Snow is on by default only on phones with enough memory (about 3 GB or more). */
+-    public static boolean defaultEnabled(Context context) {
+-        ActivityManager am = (ActivityManager) context.getSystemService(Context.ACTIVITY_SERVICE);
+-        if (am == null || am.isLowRamDevice()) return false;
+-        ActivityManager.MemoryInfo info = new ActivityManager.MemoryInfo();
+-        am.getMemoryInfo(info);
+-        return info.totalMem >= 2_500_000_000L;
+-    }
+-
+-    private static boolean allowed(Context context) {
+-        if (!LauncherPreferences.DEFAULT_PREF.getBoolean(PREF_KEY, defaultEnabled(context))) return false;
+-        PowerManager pm = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
+-        if (pm != null && pm.isPowerSaveMode()) return false;
+-        float scale = Settings.Global.getFloat(context.getContentResolver(),
+-                Settings.Global.ANIMATOR_DURATION_SCALE, 1f);
+-        return scale != 0f;
+-    }
+-
+-    private void seed(int width, int height) {
+-        float density = getResources().getDisplayMetrics().density;
+-        for (int i = 0; i < FLAKES; i++) {
+-            mSize[i] = Math.max(2, Math.round((1.5f + mRandom.nextInt(3)) * density));
+-            mX[i] = mRandom.nextFloat() * width;
+-            mY[i] = mRandom.nextFloat() * height;
+-            mSpeed[i] = (14f + mRandom.nextInt(30)) * density;
+-            mDrift[i] = (mRandom.nextFloat() - 0.5f) * 14f * density;
+-        }
+-    }
+-
+-    @Override
+-    protected void onSizeChanged(int w, int h, int oldw, int oldh) {
+-        super.onSizeChanged(w, h, oldw, oldh);
+-        if (w > 0 && h > 0) seed(w, h);
+-    }
+-
+-    private void updateAnimation() {
+-        boolean should = isShown() && isAttachedToWindow() && getWidth() > 0 && allowed(getContext());
+-        if (should && !mAnimating) {
+-            mAnimating = true;
+-            mLastFrame = SystemClock.uptimeMillis();
+-            invalidate();
+-        } else if (!should && mAnimating) {
+-            mAnimating = false;
+-            removeCallbacks(mFrame);
+-            invalidate();
+-        }
+-    }
+-
+-    @Override
+-    protected void onAttachedToWindow() {
+-        super.onAttachedToWindow();
+-        updateAnimation();
+-    }
+-
+-    @Override
+-    protected void onDetachedFromWindow() {
+-        mAnimating = false;
+-        removeCallbacks(mFrame);
+-        super.onDetachedFromWindow();
+-    }
+-
+-    @Override
+-    protected void onVisibilityChanged(View changedView, int visibility) {
+-        super.onVisibilityChanged(changedView, visibility);
+-        updateAnimation();
+-    }
+-
+-    @Override
+-    protected void onWindowVisibilityChanged(int visibility) {
+-        super.onWindowVisibilityChanged(visibility);
+-        updateAnimation();
+-    }
+-
+-    @Override
+-    protected void onLayout(boolean changed, int left, int top, int right, int bottom) {
+-        super.onLayout(changed, left, top, right, bottom);
+-        if (changed) updateAnimation();
+-    }
+-
+     @Override
+     protected void onDraw(Canvas canvas) {
+-        if (!mAnimating) return;
+         int width = getWidth();
+         int height = getHeight();
+-        long now = SystemClock.uptimeMillis();
+-        float dt = Math.min(0.2f, (now - mLastFrame) / 1000f);
+-        mLastFrame = now;
+-
+-        for (int i = 0; i < FLAKES; i++) {
+-            mY[i] += mSpeed[i] * dt;
+-            mX[i] += mDrift[i] * dt;
+-            if (mY[i] > height) {
+-                mY[i] = -mSize[i];
+-                mX[i] = mRandom.nextFloat() * width;
++        if (width <= 0 || height <= 0) return;
++        float density = getResources().getDisplayMetrics().density;
++        Random random = new Random(24); // same positions every time
++
++        for (int i = 0; i < 45; i++) {
++            String[] shape;
++            float cellDp;
++            int alpha;
++            if (i < 5) { shape = BIG; cellDp = 2.2f; alpha = 235; }
++            else if (i < 15) { shape = STAR; cellDp = 2f; alpha = 190; }
++            else if (i < 27) { shape = PLUS; cellDp = 2f; alpha = 160; }
++            else { shape = DOT; cellDp = 2f; alpha = 120; }
++
++            int cell = Math.max(2, Math.round(density * cellDp));
++            int x = (int) (random.nextFloat() * width);
++            int y = (int) (random.nextFloat() * height);
++            x -= x % cell;
++            y -= y % cell;
++            // alternate white and ice blue
++            mPaint.setColor((i % 3 == 0 ? 0x91DFFB : 0xFFFFFF) | (alpha << 24));
++            for (int row = 0; row < shape.length; row++) {
++                for (int col = 0; col < shape[row].length(); col++) {
++                    if (shape[row].charAt(col) != '#') continue;
++                    float left = x + col * cell;
++                    float top = y + row * cell;
++                    canvas.drawRect(left, top, left + cell, top + cell, mPaint);
++                }
+             }
+-            if (mX[i] < 0) mX[i] += width;
+-            else if (mX[i] > width) mX[i] -= width;
+-
+-            // Snap to a grid the size of the flake so it looks like pixel art
+-            int size = mSize[i];
+-            int sx = ((int) (mX[i] / size)) * size;
+-            int sy = ((int) (mY[i] / size)) * size;
+-            mPaint.setColor(size > 4 ? 0xCCFFFFFF : 0x99DDF2FF);
+-            canvas.drawRect(sx, sy, sx + size, sy + size, mPaint);
+         }
+-        postDelayed(mFrame, FRAME_MS);
+     }
+ }
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/game/GameActivity.java b/app_mojo/src/main/java/git/artdeell/mojo/game/GameActivity.java
+index 9c7ef3eca18d5a86b7ffdace066097175fcdf16e..c7f2da70198106b3194ad40bbf3a43392685a955 100644
+--- a/app_mojo/src/main/java/git/artdeell/mojo/game/GameActivity.java
++++ b/app_mojo/src/main/java/git/artdeell/mojo/game/GameActivity.java
+@@ -3,7 +3,6 @@ package git.artdeell.mojo.game;
+ 
+ import static git.artdeell.mojo.Tools.dialogForceClose;
+ import static git.artdeell.mojo.game.platform.Platform.PLATFORM;
+-import static git.artdeell.mojo.prefs.LauncherPreferences.PREF_ENABLE_GYRO;
+ import static git.artdeell.mojo.prefs.LauncherPreferences.PREF_SUSTAINED_PERFORMANCE;
+ import static git.artdeell.mojo.prefs.LauncherPreferences.PREF_USE_ALTERNATE_SURFACE;
+ import static git.artdeell.mojo.prefs.LauncherPreferences.PREF_VIRTUAL_MOUSE_START;
+@@ -60,7 +59,6 @@ import git.artdeell.mojo.input.ControlLayout;
+ import git.artdeell.mojo.input.CustomControls;
+ import git.artdeell.mojo.input.EditorExitable;
+ import git.artdeell.mojo.input.keyboard.TouchCharInput;
+-import git.artdeell.mojo.input.mouse.GyroControl;
+ import git.artdeell.mojo.input.mouse.HotbarView;
+ import git.artdeell.mojo.instances.Instance;
+ import git.artdeell.mojo.instances.Instances;
+@@ -94,7 +92,6 @@ public class GameActivity extends BaseActivity implements ControlButtonMenuListe
+     private DrawerLayout drawerLayout;
+     private ListView navDrawer;
+     private View mDrawerPullButton;
+-    private GyroControl mGyroControl = null;
+     private ControlLayout mControlLayout;
+     private HotbarView mHotbarView;
+     private View mLoadingScreen;
+@@ -139,8 +136,6 @@ public class GameActivity extends BaseActivity implements ControlButtonMenuListe
+ 
+         Platform.initialize(this, launcherGLView);
+ 
+-        mGyroControl = new GyroControl(this);
+-
+         // Enabling this on TextureView results in a broken white result
+         if(PREF_USE_ALTERNATE_SURFACE) getWindow().setBackgroundDrawable(null);
+         else getWindow().setBackgroundDrawable(new ColorDrawable(Color.BLACK));
+@@ -331,14 +326,12 @@ public class GameActivity extends BaseActivity implements ControlButtonMenuListe
+     public void onResume() {
+         super.onResume();
+         ContextExecutor.setActivity(this);
+-        if(PREF_ENABLE_GYRO) mGyroControl.enable();
+         PLATFORM.setHovered(true);
+     }
+ 
+     @Override
+     protected void onPause() {
+         ContextExecutor.clearActivity();
+-        mGyroControl.disable();
+         // Avoid going through the JNI each time.
+         if (Platform.isGrabbing()){
+             CallbackBridge.sendKeyPress(KeyEvent.KEYCODE_ESCAPE);
+@@ -372,7 +365,6 @@ public class GameActivity extends BaseActivity implements ControlButtonMenuListe
+     public void onConfigurationChanged(@NonNull Configuration newConfig) {
+         super.onConfigurationChanged(newConfig);
+ 
+-        if(mGyroControl != null) mGyroControl.updateOrientation();
+         // Layout resize is practically guaranteed on a configuration change, and `onConfigurationChanged`
+         // does not implicitly start a layout. So, request a layout and expect the screen dimensions to be valid after the]
+         // post.
+@@ -452,16 +444,6 @@ public class GameActivity extends BaseActivity implements ControlButtonMenuListe
+                     mHotbarView.onResolutionChanged();
+                 }
+ 
+-                @Override
+-                public void onGyroStateChanged() {
+-                    mGyroControl.updateOrientation();
+-                    if (PREF_ENABLE_GYRO) {
+-                        mGyroControl.enable();
+-                    } else {
+-                        mGyroControl.disable();
+-                    }
+-                }
+-
+                 @Override
+                 public void onButtonTransparencyChanged() {
+                     mControlLayout.updateButtonOpacity();
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/input/mouse/GyroControl.java b/app_mojo/src/main/java/git/artdeell/mojo/input/mouse/GyroControl.java
+deleted file mode 100644
+index e8c1743ce9011452c371d63b7f6a8246169af34c..0000000000000000000000000000000000000000
+--- a/app_mojo/src/main/java/git/artdeell/mojo/input/mouse/GyroControl.java
++++ /dev/null
+@@ -1,258 +0,0 @@
+-package git.artdeell.mojo.input.mouse;
+-
+-import android.app.Activity;
+-import android.content.Context;
+-import android.hardware.Sensor;
+-import android.hardware.SensorEvent;
+-import android.hardware.SensorEventListener;
+-import android.hardware.SensorManager;
+-import android.view.OrientationEventListener;
+-import android.view.Surface;
+-import android.view.WindowManager;
+-
+-import git.artdeell.mojo.game.GameView;
+-import git.artdeell.mojo.game.platform.input.PlatformGrabListener;
+-import git.artdeell.mojo.game.platform.Platform;
+-import git.artdeell.mojo.prefs.LauncherPreferences;
+-
+-import java.util.Arrays;
+-
+-
+-public class GyroControl implements SensorEventListener, PlatformGrabListener {
+-    /* How much distance has to be moved before taking into account the gyro */
+-    private static final float SINGLE_AXIS_LOW_PASS_THRESHOLD = 0.00113F;
+-    private static final float MULTI_AXIS_LOW_PASS_THRESHOLD = 0.0013F;
+-    // Warmup period of 2 since the first read from the sensor seems to produce a bogus value,
+-    // which creates a far too large of a difference on the Y axis once actual sensor data comes in
+-    private static final int ROTATION_VECTOR_WARMUP_PERIOD = 2;
+-
+-    private final WindowManager mWindowManager;
+-    private int mSurfaceRotation;
+-    private final SensorManager mSensorManager;
+-    private final Sensor mSensor;
+-    private final OrientationCorrectionListener mCorrectionListener;
+-    private boolean mShouldHandleEvents;
+-    private int mWarmup;
+-    private float xFactor; // -1 or 1 depending on device orientation
+-    private float yFactor;
+-    private boolean mSwapXY;
+-
+-    private final float[] mPreviousRotation = new float[16];
+-    private final float[] mCurrentRotation = new float[16];
+-    private final float[] mAngleDifference = new float[3];
+-
+-
+-    /* Used to average the last values, if smoothing is enabled */
+-    private final float[][] mAngleBuffer = new float[
+-            LauncherPreferences.PREF_GYRO_SMOOTHING ? 2 : 1
+-            ][3];
+-    private float xTotal = 0;
+-    private float yTotal = 0;
+-
+-    private float xAverage = 0;
+-    private float yAverage = 0;
+-    private int mHistoryIndex = -1;
+-
+-    /* Store the gyro movement under the threshold */
+-    private float mStoredX = 0;
+-    private float mStoredY = 0;
+-
+-    public GyroControl(Activity activity) {
+-        mWindowManager = activity.getWindowManager();
+-        mSurfaceRotation = -10;
+-        mSensorManager = (SensorManager) activity.getSystemService(Context.SENSOR_SERVICE);
+-        mSensor = mSensorManager.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR);
+-        mCorrectionListener = new OrientationCorrectionListener(activity);
+-        updateOrientation();
+-    }
+-
+-    public void enable() {
+-        if(mSensor == null) return;
+-        mWarmup = ROTATION_VECTOR_WARMUP_PERIOD;
+-        mSensorManager.registerListener(this, mSensor, 1000 * LauncherPreferences.PREF_GYRO_SAMPLE_RATE);
+-        mCorrectionListener.enable();
+-        // Avoid going through the JNI each time.
+-        mShouldHandleEvents = Platform.isGrabbing();
+-        Platform.addGrabListener(this);
+-    }
+-
+-    public void disable() {
+-        if(mSensor == null) return;
+-        mSensorManager.unregisterListener(this);
+-        mCorrectionListener.disable();
+-        mStoredX = mStoredY = 0;
+-        resetDamper();
+-    }
+-
+-    @Override
+-    public void onSensorChanged(SensorEvent sensorEvent) {
+-        if (!mShouldHandleEvents) return;
+-        // Copy the old array content
+-        System.arraycopy(mCurrentRotation, 0, mPreviousRotation, 0, 16);
+-        SensorManager.getRotationMatrixFromVector(mCurrentRotation, sensorEvent.values);
+-
+-
+-        if(mWarmup > 0){  // Setup initial position
+-            mWarmup--;
+-            return;
+-        }
+-        SensorManager.getAngleChange(mAngleDifference, mCurrentRotation, mPreviousRotation);
+-        damperValue(mAngleDifference);
+-        mStoredX += xAverage * LauncherPreferences.PREF_GYRO_SENSITIVITY;
+-        mStoredY += yAverage * LauncherPreferences.PREF_GYRO_SENSITIVITY;
+-
+-        boolean updatePosition = false;
+-        float absX = Math.abs(mStoredX);
+-        float absY = Math.abs(mStoredY);
+-
+-        int width = GameView.getWindowWidth();
+-        int height = GameView.getWindowHeight();
+-
+-        if(absX + absY > MULTI_AXIS_LOW_PASS_THRESHOLD) {
+-            Platform.cursorX -= ((mSwapXY ? mStoredY : mStoredX) * xFactor) * width;
+-            Platform.cursorY += ((mSwapXY ? mStoredX : mStoredY) * yFactor) * height;
+-            mStoredX = 0;
+-            mStoredY = 0;
+-            updatePosition = true;
+-        } else {
+-            if(Math.abs(mStoredX) > SINGLE_AXIS_LOW_PASS_THRESHOLD){
+-                Platform.cursorX -= ((mSwapXY ? mStoredY : mStoredX) * xFactor) * width;
+-                mStoredX = 0;
+-                updatePosition = true;
+-            }
+-
+-            if(Math.abs(mStoredY) > SINGLE_AXIS_LOW_PASS_THRESHOLD) {
+-                Platform.cursorY += ((mSwapXY ? mStoredX : mStoredY) * yFactor) * height;
+-                mStoredY = 0;
+-                updatePosition = true;
+-            }
+-        }
+-
+-        if(updatePosition){
+-            Platform.sendCursorPosition();
+-        }
+-    }
+-
+-    /** Update the axis mapping in accordance to activity rotation, used for initial rotation */
+-    public void updateOrientation(){
+-        int rotation = mWindowManager.getDefaultDisplay().getRotation();
+-        mSurfaceRotation = rotation;
+-        switch (rotation){
+-            case Surface.ROTATION_0:
+-                mSwapXY = true;
+-                xFactor = 1;
+-                yFactor = 1;
+-                break;
+-            case Surface.ROTATION_90:
+-                mSwapXY = false;
+-                xFactor = -1;
+-                yFactor = 1;
+-                break;
+-            case Surface.ROTATION_180:
+-                mSwapXY = true;
+-                xFactor = -1;
+-                yFactor = -1;
+-                break;
+-            case Surface.ROTATION_270:
+-                mSwapXY = false;
+-                xFactor = 1;
+-                yFactor = -1;
+-                break;
+-        }
+-
+-        if(LauncherPreferences.PREF_GYRO_INVERT_X) xFactor *= -1;
+-        if(LauncherPreferences.PREF_GYRO_INVERT_Y) yFactor *= -1;
+-    }
+-
+-    @Override
+-    public void onAccuracyChanged(Sensor sensor, int i) {}
+-
+-    @Override
+-    public void onGrabState(boolean isGrabbing) {
+-        mWarmup = ROTATION_VECTOR_WARMUP_PERIOD;
+-        mShouldHandleEvents = isGrabbing;
+-    }
+-
+-
+-    /**
+-     * Compute the moving average of the gyroscope to reduce jitter
+-     * @param newAngleDifference The new angle difference
+-     */
+-    private void damperValue(float[] newAngleDifference){
+-        mHistoryIndex ++;
+-        if(mHistoryIndex >= mAngleBuffer.length) mHistoryIndex = 0;
+-
+-        xTotal -= mAngleBuffer[mHistoryIndex][1];
+-        yTotal -= mAngleBuffer[mHistoryIndex][2];
+-
+-        System.arraycopy(newAngleDifference, 0, mAngleBuffer[mHistoryIndex], 0, 3);
+-
+-        xTotal += mAngleBuffer[mHistoryIndex][1];
+-        yTotal += mAngleBuffer[mHistoryIndex][2];
+-
+-        // compute the moving average
+-        xAverage = xTotal / mAngleBuffer.length;
+-        yAverage = yTotal / mAngleBuffer.length;
+-    }
+-
+-    /** Reset the moving average data */
+-    private void resetDamper(){
+-        mHistoryIndex = -1;
+-        xTotal = 0;
+-        yTotal = 0;
+-        xAverage = 0;
+-        yAverage = 0;
+-        for(float[] oldAngle : mAngleBuffer){
+-            Arrays.fill(oldAngle, 0);
+-        }
+-    }
+-
+-    class OrientationCorrectionListener extends OrientationEventListener {
+-
+-        public OrientationCorrectionListener(Context context) {
+-            super(context, SensorManager.SENSOR_DELAY_NORMAL);
+-        }
+-
+-        @Override
+-        public void onOrientationChanged(int i) {
+-            // Force to wait to be in game before setting factors
+-            // Theoretically, one could use the whole interface in portrait...
+-            if(!mShouldHandleEvents) return;
+-
+-            if(i == OrientationEventListener.ORIENTATION_UNKNOWN) {
+-                return; //change nothing
+-            }
+-
+-
+-
+-            switch (mSurfaceRotation){
+-                case Surface.ROTATION_90:
+-                case Surface.ROTATION_270:
+-                    mSwapXY = false;
+-                    if(225 <  i && i < 315) {
+-                        xFactor = -1;
+-                        yFactor = 1;
+-                    }else if(45 < i && i < 135) {
+-                        xFactor = 1;
+-                        yFactor = -1;
+-                    }
+-                    break;
+-
+-                case Surface.ROTATION_0:
+-                case Surface.ROTATION_180:
+-                    mSwapXY = true;
+-                    if((315 < i && i <= 360) || (i < 45) ) {
+-                        xFactor = 1;
+-                        yFactor = 1;
+-                    }else if(135 < i && i < 225) {
+-                        xFactor = -1;
+-                        yFactor = -1;
+-                    }
+-                    break;
+-            }
+-
+-            if(LauncherPreferences.PREF_GYRO_INVERT_X) xFactor *= -1;
+-            if(LauncherPreferences.PREF_GYRO_INVERT_Y) yFactor *= -1;
+-        }
+-    }
+-}
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/prefs/LauncherPreferences.java b/app_mojo/src/main/java/git/artdeell/mojo/prefs/LauncherPreferences.java
+index 392820792547419af308a3aeb984d87c6826c60c..be24317a5096f917cd076440f861f06dd2788b81 100644
+--- a/app_mojo/src/main/java/git/artdeell/mojo/prefs/LauncherPreferences.java
++++ b/app_mojo/src/main/java/git/artdeell/mojo/prefs/LauncherPreferences.java
+@@ -49,12 +49,6 @@ public class LauncherPreferences {
+     public static boolean PREF_JAVA_SANDBOX = true;
+     public static float PREF_SCALE_FACTOR = 1f;
+ 
+-    public static boolean PREF_ENABLE_GYRO = false;
+-    public static float PREF_GYRO_SENSITIVITY = 1f;
+-    public static int PREF_GYRO_SAMPLE_RATE = 16;
+-    public static boolean PREF_GYRO_SMOOTHING = true;
+-    public static boolean PREF_GYRO_INVERT_X = false;
+-    public static boolean PREF_GYRO_INVERT_Y = false;
+ 
+     public static boolean PREF_FORCE_VSYNC = false;
+ 
+@@ -103,12 +97,6 @@ public class LauncherPreferences {
+         PREF_USE_ALTERNATE_SURFACE = DEFAULT_PREF.getBoolean("alternate_surface", isDevicePowerful);
+         PREF_JAVA_SANDBOX = DEFAULT_PREF.getBoolean("java_sandbox", true);
+         PREF_SCALE_FACTOR = DEFAULT_PREF.getInt("resolutionRatio", findBestResolution(ctx, isDevicePowerful))/100f;
+-        PREF_ENABLE_GYRO = DEFAULT_PREF.getBoolean("enableGyro", false);
+-        PREF_GYRO_SENSITIVITY = ((float)DEFAULT_PREF.getInt("gyroSensitivity", 100))/100f;
+-        PREF_GYRO_SAMPLE_RATE = DEFAULT_PREF.getInt("gyroSampleRate", 16);
+-        PREF_GYRO_SMOOTHING = DEFAULT_PREF.getBoolean("gyroSmoothing", true);
+-        PREF_GYRO_INVERT_X = DEFAULT_PREF.getBoolean("gyroInvertX", false);
+-        PREF_GYRO_INVERT_Y = DEFAULT_PREF.getBoolean("gyroInvertY", false);
+         PREF_FORCE_VSYNC = DEFAULT_PREF.getBoolean("force_vsync", isDevicePowerful);
+         PREF_USE_ANGLE = DEFAULT_PREF.getBoolean("use_angle", false);
+         PREF_BUTTON_ALL_CAPS = DEFAULT_PREF.getBoolean("buttonAllCaps", true);
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/prefs/QuickSettingSideDialog.java b/app_mojo/src/main/java/git/artdeell/mojo/prefs/QuickSettingSideDialog.java
+index 247a52d1a7ac6f98339b20bbbaa817e328789801..74578a42295e4b61da2bca2a47f2b7d17d7d7cf4 100644
+--- a/app_mojo/src/main/java/git/artdeell/mojo/prefs/QuickSettingSideDialog.java
++++ b/app_mojo/src/main/java/git/artdeell/mojo/prefs/QuickSettingSideDialog.java
+@@ -2,10 +2,6 @@ package git.artdeell.mojo.prefs;
+ 
+ import static git.artdeell.mojo.prefs.LauncherPreferences.PREF_BUTTON_TRANSPARENCY;
+ import static git.artdeell.mojo.prefs.LauncherPreferences.PREF_DISABLE_GESTURES;
+-import static git.artdeell.mojo.prefs.LauncherPreferences.PREF_ENABLE_GYRO;
+-import static git.artdeell.mojo.prefs.LauncherPreferences.PREF_GYRO_INVERT_X;
+-import static git.artdeell.mojo.prefs.LauncherPreferences.PREF_GYRO_INVERT_Y;
+-import static git.artdeell.mojo.prefs.LauncherPreferences.PREF_GYRO_SENSITIVITY;
+ import static git.artdeell.mojo.prefs.LauncherPreferences.PREF_LONGPRESS_TRIGGER;
+ import static git.artdeell.mojo.prefs.LauncherPreferences.PREF_MOUSESPEED;
+ import static git.artdeell.mojo.prefs.LauncherPreferences.PREF_SCALE_FACTOR;
+@@ -32,12 +28,12 @@ public abstract class QuickSettingSideDialog extends com.kdt.SideDialogView {
+ 
+     private SharedPreferences.Editor mEditor;
+ 
+-    private SwitchCompat mGyroSwitch, mGyroXSwitch, mGyroYSwitch, mGestureSwitch;
+-    private CustomSeekbar mGyroSensitivityBar, mMouseSpeedBar, mGestureDelayBar, mResolutionBar, mTransparencyBar;
+-    private TextView mGyroSensitivityText, mGyroSensitivityDisplayText, mMouseSpeedText, mGestureDelayText, mGestureDelayDisplayText, mResolutionText, mTransparencyText;
++    private SwitchCompat mGestureSwitch;
++    private CustomSeekbar mMouseSpeedBar, mGestureDelayBar, mResolutionBar, mTransparencyBar;
++    private TextView mMouseSpeedText, mGestureDelayText, mGestureDelayDisplayText, mResolutionText, mTransparencyText;
+ 
+-    private boolean mOriginalGyroEnabled, mOriginalGyroXEnabled, mOriginalGyroYEnabled, mOriginalGestureDisabled;
+-    private float mOriginalGyroSensitivity, mOriginalMouseSpeed, mOriginalResolution;
++    private boolean mOriginalGestureDisabled;
++    private float mOriginalMouseSpeed, mOriginalResolution;
+     private int mOriginalGestureDelay;
+     private short mOriginalTransparency;
+ 
+@@ -52,7 +48,6 @@ public abstract class QuickSettingSideDialog extends com.kdt.SideDialogView {
+         bindLayout();
+         Tools.runOnUiThread(() -> {
+             this.setupListeners();
+-            this.updateGyroCompatibility();
+         });
+     }
+ 
+@@ -63,19 +58,13 @@ public abstract class QuickSettingSideDialog extends com.kdt.SideDialogView {
+ 
+     private void bindLayout() {
+         // Bind layout elements
+-        mGyroSwitch = mDialogContent.findViewById(R.id.checkboxGyro);
+-        mGyroXSwitch = mDialogContent.findViewById(R.id.checkboxGyroX);
+-        mGyroYSwitch = mDialogContent.findViewById(R.id.checkboxGyroY);
+         mGestureSwitch = mDialogContent.findViewById(R.id.checkboxGesture);
+ 
+-        mGyroSensitivityBar = mDialogContent.findViewById(R.id.editGyro_seekbar);
+         mMouseSpeedBar = mDialogContent.findViewById(R.id.editMouseSpeed_seekbar);
+         mGestureDelayBar = mDialogContent.findViewById(R.id.editGestureDelay_seekbar);
+         mResolutionBar = mDialogContent.findViewById(R.id.editResolution_seekbar);
+         mTransparencyBar = mDialogContent.findViewById(R.id.buttonTransparency_seekBar);
+ 
+-        mGyroSensitivityText = mDialogContent.findViewById(R.id.editGyro_textView_percent);
+-        mGyroSensitivityDisplayText = mDialogContent.findViewById(R.id.editGyro_textView);
+         mMouseSpeedText = mDialogContent.findViewById(R.id.editMouseSpeed_textView_percent);
+         mGestureDelayText = mDialogContent.findViewById(R.id.editGestureDelay_textView_percent);
+         mGestureDelayDisplayText = mDialogContent.findViewById(R.id.editGestureDelay_textView);
+@@ -86,55 +75,21 @@ public abstract class QuickSettingSideDialog extends com.kdt.SideDialogView {
+     private void setupListeners() {
+         mEditor = LauncherPreferences.DEFAULT_PREF.edit();
+ 
+-        mOriginalGyroEnabled = PREF_ENABLE_GYRO;
+-        mOriginalGyroXEnabled = PREF_GYRO_INVERT_X;
+-        mOriginalGyroYEnabled = PREF_GYRO_INVERT_Y;
+         mOriginalGestureDisabled = PREF_DISABLE_GESTURES;
+ 
+-        mOriginalGyroSensitivity = PREF_GYRO_SENSITIVITY;
+         mOriginalMouseSpeed = PREF_MOUSESPEED;
+         mOriginalGestureDelay = PREF_LONGPRESS_TRIGGER;
+         mOriginalResolution = PREF_SCALE_FACTOR;
+         mOriginalTransparency = PREF_BUTTON_TRANSPARENCY;
+ 
+-        mGyroSwitch.setChecked(mOriginalGyroEnabled);
+-        mGyroXSwitch.setChecked(mOriginalGyroXEnabled);
+-        mGyroYSwitch.setChecked(mOriginalGyroYEnabled);
+         mGestureSwitch.setChecked(mOriginalGestureDisabled);
+ 
+-        mGyroSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> {
+-            PREF_ENABLE_GYRO = isChecked;
+-            onGyroStateChanged();
+-            updateGyroVisibility(isChecked);
+-            mEditor.putBoolean("enableGyro", isChecked);
+-        });
+-
+-        mGyroXSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> {
+-            PREF_GYRO_INVERT_X = isChecked;
+-            onGyroStateChanged();
+-            mEditor.putBoolean("gyroInvertX", isChecked);
+-        });
+-
+-        mGyroYSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> {
+-            PREF_GYRO_INVERT_Y = isChecked;
+-            onGyroStateChanged();
+-            mEditor.putBoolean("gyroInvertY", isChecked);
+-        });
+-
+         mGestureSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> {
+             PREF_DISABLE_GESTURES = isChecked;
+             updateGestureVisibility(isChecked);
+             mEditor.putBoolean("disableGestures", isChecked);
+         });
+ 
+-        mGyroSensitivityBar.setOnSeekBarChangeListener((SimpleSeekBarListener) (seekBar, progress, fromUser) -> {
+-            PREF_GYRO_SENSITIVITY = progress / 100f;
+-            mEditor.putInt("gyroSensitivity", progress);
+-            setSeekTextPercent(mGyroSensitivityText, progress);
+-        });
+-        mGyroSensitivityBar.setProgress((int) (mOriginalGyroSensitivity * 100f));
+-        setSeekTextPercent(mGyroSensitivityText, mGyroSensitivityBar.getProgress());
+-
+         mMouseSpeedBar.setOnSeekBarChangeListener((SimpleSeekBarListener) (seekBar, progress, fromUser) -> {
+             PREF_MOUSESPEED = progress / 100f;
+             mEditor.putInt("mousespeed", progress);
+@@ -170,7 +125,6 @@ public abstract class QuickSettingSideDialog extends com.kdt.SideDialogView {
+         });
+ 
+ 
+-        updateGyroVisibility(mOriginalGyroEnabled);
+         updateGestureVisibility(mOriginalGestureDisabled);
+     }
+ 
+@@ -186,24 +140,6 @@ public abstract class QuickSettingSideDialog extends com.kdt.SideDialogView {
+         target.setText(target.getContext().getString(format, value));
+     }
+ 
+-    private void updateGyroVisibility(boolean isEnabled) {
+-        int visibility = isEnabled ? View.VISIBLE : View.GONE;
+-        mGyroXSwitch.setVisibility(visibility);
+-        mGyroYSwitch.setVisibility(visibility);
+-
+-        mGyroSensitivityBar.setVisibility(visibility);
+-        mGyroSensitivityText.setVisibility(visibility);
+-        mGyroSensitivityDisplayText.setVisibility(visibility);
+-    }
+-
+-    private void updateGyroCompatibility() {
+-        boolean isGyroAvailable = Tools.deviceSupportsGyro(mDialogContent.getContext());
+-        if (!isGyroAvailable) {
+-            mGyroSwitch.setVisibility(View.GONE);
+-            updateGestureVisibility(false);
+-        }
+-    }
+-
+     private void updateGestureVisibility(boolean isDisabled) {
+         int visibility = isDisabled ? View.GONE : View.VISIBLE;
+         mGestureDelayBar.setVisibility(visibility);
+@@ -212,12 +148,8 @@ public abstract class QuickSettingSideDialog extends com.kdt.SideDialogView {
+     }
+ 
+     private void removeListeners() {
+-        mGyroSwitch.setOnCheckedChangeListener(null);
+-        mGyroXSwitch.setOnCheckedChangeListener(null);
+-        mGyroYSwitch.setOnCheckedChangeListener(null);
+         mGestureSwitch.setOnCheckedChangeListener(null);
+ 
+-        mGyroSensitivityBar.setOnSeekBarChangeListener(null);
+         mMouseSpeedBar.setOnSeekBarChangeListener(null);
+         mGestureDelayBar.setOnSeekBarChangeListener(null);
+         mResolutionBar.setOnSeekBarChangeListener(null);
+@@ -236,18 +168,13 @@ public abstract class QuickSettingSideDialog extends com.kdt.SideDialogView {
+     public void cancel() {
+         // Reset all settings if we were editing
+         if(isDisplaying()) {
+-            PREF_ENABLE_GYRO = mOriginalGyroEnabled;
+-            PREF_GYRO_INVERT_X = mOriginalGyroXEnabled;
+-            PREF_GYRO_INVERT_Y = mOriginalGyroYEnabled;
+             PREF_DISABLE_GESTURES = mOriginalGestureDisabled;
+ 
+-            PREF_GYRO_SENSITIVITY = mOriginalGyroSensitivity;
+             PREF_MOUSESPEED = mOriginalMouseSpeed;
+             PREF_LONGPRESS_TRIGGER = mOriginalGestureDelay;
+             PREF_SCALE_FACTOR = mOriginalResolution;
+             PREF_BUTTON_TRANSPARENCY = mOriginalTransparency;
+ 
+-            onGyroStateChanged();
+             onResolutionChanged();
+             onButtonTransparencyChanged();
+         }
+@@ -258,13 +185,6 @@ public abstract class QuickSettingSideDialog extends com.kdt.SideDialogView {
+     /** Called when the resolution is changed. Use {@link LauncherPreferences#PREF_SCALE_FACTOR} */
+     public abstract void onResolutionChanged();
+ 
+-    /** Called when the gyro state is changed.
+-     * Use {@link LauncherPreferences#PREF_ENABLE_GYRO}
+-     * Use {@link LauncherPreferences#PREF_GYRO_INVERT_X}
+-     * Use {@link LauncherPreferences#PREF_GYRO_INVERT_Y}
+-     */
+-    public abstract void onGyroStateChanged();
+-
+     /**
+      * Called when the button transparency state is changed. Use {@link LauncherPreferences#PREF_BUTTON_TRANSPARENCY}
+      */
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/prefs/screens/LauncherPreferenceControlFragment.java b/app_mojo/src/main/java/git/artdeell/mojo/prefs/screens/LauncherPreferenceControlFragment.java
+index 8bb02721bc8098b6912c5d882599a6cece52af08..1d551cdf8ac7204d17b63183649180505cce1a01 100644
+--- a/app_mojo/src/main/java/git/artdeell/mojo/prefs/screens/LauncherPreferenceControlFragment.java
++++ b/app_mojo/src/main/java/git/artdeell/mojo/prefs/screens/LauncherPreferenceControlFragment.java
+@@ -12,16 +12,13 @@ import git.artdeell.mojo.prefs.CustomSeekBarPreference;
+ import git.artdeell.mojo.prefs.LauncherPreferences;
+ 
+ public class LauncherPreferenceControlFragment extends LauncherPreferenceFragment {
+-    private boolean mGyroAvailable = false;
+     @Override
+     public void onCreatePreferences(Bundle b, String str) {
+         // Get values
+         int longPressTrigger = LauncherPreferences.PREF_LONGPRESS_TRIGGER;
+         int prefButtonSize = (int) LauncherPreferences.PREF_BUTTONSIZE;
+         int mouseScale = (int) (LauncherPreferences.PREF_MOUSESCALE * 100);
+-        int gyroSampleRate = LauncherPreferences.PREF_GYRO_SAMPLE_RATE;
+         float mouseSpeed = LauncherPreferences.PREF_MOUSESPEED;
+-        float gyroSpeed = LauncherPreferences.PREF_GYRO_SENSITIVITY;
+         float joystickDeadzone = LauncherPreferences.PREF_DEADZONE_SCALE;
+ 
+ 
+@@ -59,23 +56,6 @@ public class LauncherPreferenceControlFragment extends LauncherPreferenceFragmen
+         buttonTransparency.setSuffix(" %");
+ 
+ 
+-        Context context = getContext();
+-        if(context != null) {
+-            mGyroAvailable = Tools.deviceSupportsGyro(context);
+-        }
+-        PreferenceCategory gyroCategory =  requirePreference("gyroCategory",
+-                PreferenceCategory.class);
+-        gyroCategory.setVisible(mGyroAvailable);
+-
+-        CustomSeekBarPreference gyroSensitivitySeek = requirePreference("gyroSensitivity",
+-                CustomSeekBarPreference.class);
+-        gyroSensitivitySeek.setValue((int) (gyroSpeed*100f));
+-        gyroSensitivitySeek.setSuffix(" %");
+-
+-        CustomSeekBarPreference gyroSampleRateSeek = requirePreference("gyroSampleRate",
+-                CustomSeekBarPreference.class);
+-        gyroSampleRateSeek.setValue(gyroSampleRate);
+-        gyroSampleRateSeek.setSuffix(" ms");
+         computeVisibility();
+     }
+ 
+@@ -87,11 +67,6 @@ public class LauncherPreferenceControlFragment extends LauncherPreferenceFragmen
+ 
+     private void computeVisibility(){
+         requirePreference("timeLongPressTrigger").setVisible(!LauncherPreferences.PREF_DISABLE_GESTURES);
+-        requirePreference("gyroSensitivity").setVisible(LauncherPreferences.PREF_ENABLE_GYRO);
+-        requirePreference("gyroSampleRate").setVisible(LauncherPreferences.PREF_ENABLE_GYRO);
+-        requirePreference("gyroInvertX").setVisible(LauncherPreferences.PREF_ENABLE_GYRO);
+-        requirePreference("gyroInvertY").setVisible(LauncherPreferences.PREF_ENABLE_GYRO);
+-        requirePreference("gyroSmoothing").setVisible(LauncherPreferences.PREF_ENABLE_GYRO);
+     }
+ 
+ }
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/utils/jre/JavaRunner.java b/app_mojo/src/main/java/git/artdeell/mojo/utils/jre/JavaRunner.java
+index 606582431008d5c265d65b43f07baabd6ac43056..c96664465b65c7d02a25d4078efa949e0a345b99 100644
+--- a/app_mojo/src/main/java/git/artdeell/mojo/utils/jre/JavaRunner.java
++++ b/app_mojo/src/main/java/git/artdeell/mojo/utils/jre/JavaRunner.java
+@@ -101,6 +101,15 @@ public class JavaRunner {
+         // and ignore System.gc() calls from the game and mods (they cause long freezes on phones)
+         addFlagUnlessPresent(userArguments, "-XX:-BytecodeVerificationRemote", "-XX:+BytecodeVerificationRemote", "-Xverify", "-noverify");
+         addFlagUnlessPresent(userArguments, "-XX:+DisableExplicitGC", "-XX:-DisableExplicitGC");
++        // FrostFox: skip the performance-counter file Java writes on start (slow storage access, extra memory)
++        addFlagUnlessPresent(userArguments, "-XX:-UsePerfData", "-XX:+UsePerfData");
++        // FrostFox: one simple collector instead of several worker threads (those get scheduled on slow phone cores),
++        // with a modest young generation: lower memory use and short, even pauses
++        if(!hasCollectorFlag(userArguments)) userArguments.add(0, "-XX:+UseSerialGC");
++        if(!hasYoungSizeFlag(userArguments)) {
++            int youngMb = Math.max(64, Math.min(256, LauncherPreferences.PREF_RAM_ALLOCATION / 4));
++            userArguments.add(0, "-Xmn" + youngMb + "M");
++        }
+ 
+         ArrayList<String> overridableArguments = new ArrayList<>(Arrays.asList(
+                 "-Djava.home=" + runtimeHome,
+@@ -152,6 +161,21 @@ public class JavaRunner {
+         return userArguments;
+     }
+ 
++    private static boolean hasCollectorFlag(List<String> arguments) {
++        for(String argument : arguments) {
++            if(argument.matches("-XX:\\+Use(Serial|Parallel|ParallelOld|ConcMarkSweep|G1|Z|Shenandoah)GC")) return true;
++        }
++        return false;
++    }
++
++    private static boolean hasYoungSizeFlag(List<String> arguments) {
++        for(String argument : arguments) {
++            if(argument.startsWith("-Xmn") || argument.startsWith("-XX:NewSize") || argument.startsWith("-XX:MaxNewSize")
++                    || argument.startsWith("-XX:NewRatio")) return true;
++        }
++        return false;
++    }
++
+     private static void addFlagUnlessPresent(List<String> arguments, String flag, String... conflicts) {
+         for(String argument : arguments) {
+             if(argument.equals(flag)) return;
+diff --git a/app_mojo/src/main/res/layout-land/fragment_launcher.xml b/app_mojo/src/main/res/layout-land/fragment_launcher.xml
+index f5701d57db3e4bf0b2b2b7d00055e97c6772925c..4cc60f3ea42d2c5678a66572e93d0cc7cffdf44b 100644
+--- a/app_mojo/src/main/res/layout-land/fragment_launcher.xml
++++ b/app_mojo/src/main/res/layout-land/fragment_launcher.xml
+@@ -68,138 +68,182 @@
+ 			android:paddingBottom="8dp">
+ 
+ 			<LinearLayout
+-				android:layout_width="match_parent"
+-				android:layout_height="wrap_content"
+-				android:orientation="horizontal">
++			    android:layout_width="match_parent"
++			    android:layout_height="wrap_content"
++			    android:orientation="horizontal">
+ 
+ 				<LinearLayout
+-					android:id="@+id/install_jar_button"
+-					android:layout_width="0dp"
+-					android:layout_height="88dp"
+-					android:layout_weight="1"
+-					android:layout_marginStart="0dp"
+-					android:layout_marginEnd="6dp"
+-					android:background="@drawable/bg_home_card"
+-					android:clickable="true"
+-					android:focusable="true"
+-					android:gravity="center"
+-					android:orientation="vertical">
+-
+-					<ImageView
+-						android:layout_width="32dp"
+-						android:layout_height="32dp"
+-						android:importantForAccessibility="no"
+-						android:src="@drawable/ic_px_java_run"
+-						android:tint="#91DFFB" />
+-
+-					<TextView
+-						android:layout_width="wrap_content"
+-						android:layout_height="wrap_content"
+-						android:layout_marginTop="6dp"
+-						android:text="Mods"
+-						android:textColor="#FFFFFF"
+-						android:textSize="14sp"
+-						android:textStyle="bold" />
++				    android:id="@+id/install_jar_button"
++				    android:layout_width="0dp"
++				    android:layout_height="88dp"
++				    android:layout_weight="1"
++				    android:layout_marginStart="0dp"
++				    android:layout_marginEnd="6dp"
++				    android:background="@drawable/bg_home_card"
++				    android:clickable="true"
++				    android:focusable="true"
++				    android:gravity="center"
++				    android:orientation="vertical">
++
++				    <ImageView
++				        android:layout_width="32dp"
++				        android:layout_height="32dp"
++				        android:importantForAccessibility="no"
++				        android:src="@drawable/ic_px_java_run"
++				        android:tint="#91DFFB" />
++
++				    <TextView
++				        android:layout_width="wrap_content"
++				        android:layout_height="wrap_content"
++				        android:layout_marginTop="6dp"
++				        android:text="Mods"
++				        android:textColor="#FFFFFF"
++				        android:textSize="14sp"
++				        android:textStyle="bold" />
+ 				</LinearLayout>
+ 
+ 				<LinearLayout
+-					android:id="@+id/custom_control_button"
+-					android:layout_width="0dp"
+-					android:layout_height="88dp"
+-					android:layout_weight="1"
+-					android:layout_marginStart="6dp"
+-					android:layout_marginEnd="0dp"
+-					android:background="@drawable/bg_home_card"
+-					android:clickable="true"
+-					android:focusable="true"
+-					android:gravity="center"
+-					android:orientation="vertical">
+-
+-					<ImageView
+-						android:layout_width="32dp"
+-						android:layout_height="32dp"
+-						android:importantForAccessibility="no"
+-						android:src="@drawable/ic_px_gamepad"
+-						android:tint="#91DFFB" />
+-
+-					<TextView
+-						android:layout_width="wrap_content"
+-						android:layout_height="wrap_content"
+-						android:layout_marginTop="6dp"
+-						android:text="Controls"
+-						android:textColor="#FFFFFF"
+-						android:textSize="14sp"
+-						android:textStyle="bold" />
++				    android:id="@+id/resource_packs_button"
++				    android:layout_width="0dp"
++				    android:layout_height="88dp"
++				    android:layout_weight="1"
++				    android:layout_marginStart="6dp"
++				    android:layout_marginEnd="0dp"
++				    android:background="@drawable/bg_home_card"
++				    android:clickable="true"
++				    android:focusable="true"
++				    android:gravity="center"
++				    android:orientation="vertical">
++
++				    <ImageView
++				        android:layout_width="32dp"
++				        android:layout_height="32dp"
++				        android:importantForAccessibility="no"
++				        android:src="@drawable/ic_px_image"
++				        android:tint="#91DFFB" />
++
++				    <TextView
++				        android:layout_width="wrap_content"
++				        android:layout_height="wrap_content"
++				        android:layout_marginTop="6dp"
++				        android:text="Resource packs"
++				        android:textColor="#FFFFFF"
++				        android:textSize="14sp"
++				        android:textStyle="bold" />
+ 				</LinearLayout>
+ 
+ 			</LinearLayout>
+ 
+ 			<LinearLayout
+-				android:layout_width="match_parent"
+-				android:layout_height="wrap_content"
+-				android:layout_marginTop="12dp"
+-				android:orientation="horizontal">
++			    android:layout_width="match_parent"
++			    android:layout_height="wrap_content"
++			    android:layout_marginTop="12dp"
++			    android:orientation="horizontal">
++
++				<LinearLayout
++				    android:id="@+id/custom_control_button"
++				    android:layout_width="0dp"
++				    android:layout_height="88dp"
++				    android:layout_weight="1"
++				    android:layout_marginStart="0dp"
++				    android:layout_marginEnd="6dp"
++				    android:background="@drawable/bg_home_card"
++				    android:clickable="true"
++				    android:focusable="true"
++				    android:gravity="center"
++				    android:orientation="vertical">
++
++				    <ImageView
++				        android:layout_width="32dp"
++				        android:layout_height="32dp"
++				        android:importantForAccessibility="no"
++				        android:src="@drawable/ic_px_gamepad"
++				        android:tint="#91DFFB" />
++
++				    <TextView
++				        android:layout_width="wrap_content"
++				        android:layout_height="wrap_content"
++				        android:layout_marginTop="6dp"
++				        android:text="Controls"
++				        android:textColor="#FFFFFF"
++				        android:textSize="14sp"
++				        android:textStyle="bold" />
++				</LinearLayout>
+ 
+ 				<LinearLayout
+-					android:id="@+id/open_files_button"
+-					android:layout_width="0dp"
+-					android:layout_height="88dp"
+-					android:layout_weight="1"
+-					android:layout_marginStart="0dp"
+-					android:layout_marginEnd="6dp"
+-					android:background="@drawable/bg_home_card"
+-					android:clickable="true"
+-					android:focusable="true"
+-					android:gravity="center"
+-					android:orientation="vertical">
+-
+-					<ImageView
+-						android:layout_width="32dp"
+-						android:layout_height="32dp"
+-						android:importantForAccessibility="no"
+-						android:src="@drawable/ic_px_folder"
+-						android:tint="#91DFFB" />
+-
+-					<TextView
+-						android:layout_width="wrap_content"
+-						android:layout_height="wrap_content"
+-						android:layout_marginTop="6dp"
+-						android:text="Files"
+-						android:textColor="#FFFFFF"
+-						android:textSize="14sp"
+-						android:textStyle="bold" />
++				    android:id="@+id/open_files_button"
++				    android:layout_width="0dp"
++				    android:layout_height="88dp"
++				    android:layout_weight="1"
++				    android:layout_marginStart="6dp"
++				    android:layout_marginEnd="0dp"
++				    android:background="@drawable/bg_home_card"
++				    android:clickable="true"
++				    android:focusable="true"
++				    android:gravity="center"
++				    android:orientation="vertical">
++
++				    <ImageView
++				        android:layout_width="32dp"
++				        android:layout_height="32dp"
++				        android:importantForAccessibility="no"
++				        android:src="@drawable/ic_px_folder"
++				        android:tint="#91DFFB" />
++
++				    <TextView
++				        android:layout_width="wrap_content"
++				        android:layout_height="wrap_content"
++				        android:layout_marginTop="6dp"
++				        android:text="Files"
++				        android:textColor="#FFFFFF"
++				        android:textSize="14sp"
++				        android:textStyle="bold" />
+ 				</LinearLayout>
+ 
++			</LinearLayout>
++
++			<LinearLayout
++			    android:layout_width="match_parent"
++			    android:layout_height="wrap_content"
++			    android:layout_marginTop="12dp"
++			    android:orientation="horizontal">
++
+ 				<LinearLayout
+-					android:id="@+id/share_logs_button"
+-					android:layout_width="0dp"
+-					android:layout_height="88dp"
+-					android:layout_weight="1"
+-					android:layout_marginStart="6dp"
+-					android:layout_marginEnd="0dp"
+-					android:background="@drawable/bg_home_card"
+-					android:clickable="true"
+-					android:focusable="true"
+-					android:gravity="center"
+-					android:orientation="vertical">
+-
+-					<ImageView
+-						android:layout_width="32dp"
+-						android:layout_height="32dp"
+-						android:importantForAccessibility="no"
+-						android:src="@drawable/ic_px_sharelog"
+-						android:tint="#91DFFB" />
+-
+-					<TextView
+-						android:layout_width="wrap_content"
+-						android:layout_height="wrap_content"
+-						android:layout_marginTop="6dp"
+-						android:text="Logs"
+-						android:textColor="#FFFFFF"
+-						android:textSize="14sp"
+-						android:textStyle="bold" />
++				    android:id="@+id/share_logs_button"
++				    android:layout_width="0dp"
++				    android:layout_height="88dp"
++				    android:layout_weight="1"
++				    android:layout_marginStart="0dp"
++				    android:layout_marginEnd="6dp"
++				    android:background="@drawable/bg_home_card"
++				    android:clickable="true"
++				    android:focusable="true"
++				    android:gravity="center"
++				    android:orientation="vertical">
++
++				    <ImageView
++				        android:layout_width="32dp"
++				        android:layout_height="32dp"
++				        android:importantForAccessibility="no"
++				        android:src="@drawable/ic_px_sharelog"
++				        android:tint="#91DFFB" />
++
++				    <TextView
++				        android:layout_width="wrap_content"
++				        android:layout_height="wrap_content"
++				        android:layout_marginTop="6dp"
++				        android:text="Logs"
++				        android:textColor="#FFFFFF"
++				        android:textSize="14sp"
++				        android:textStyle="bold" />
+ 				</LinearLayout>
+ 
++				<View
++				    android:layout_width="0dp"
++				    android:layout_height="1dp"
++				    android:layout_weight="1"
++				    android:layout_marginStart="6dp" />
++
+ 			</LinearLayout>
+ 		</LinearLayout>
+ 	</ScrollView>
+diff --git a/app_mojo/src/main/res/layout/activity_basemain.xml b/app_mojo/src/main/res/layout/activity_basemain.xml
+index 715dc6e616f59e6c5213347176c39b239fd46576..f41645b8876e156273d4fd8b5b2c48b4dd49ad75 100644
+--- a/app_mojo/src/main/res/layout/activity_basemain.xml
++++ b/app_mojo/src/main/res/layout/activity_basemain.xml
+@@ -96,13 +96,6 @@
+ 					android:textColor="@android:color/white"
+ 					android:textSize="16sp" />
+ 
+-				<TextView
+-					android:id="@+id/main_loading_screen_warning"
+-					android:layout_width="wrap_content"
+-					android:layout_height="wrap_content"
+-					android:text="@string/loading_screen_warning"
+-					android:textColor="@android:color/darker_gray"
+-					android:textSize="12sp" />
+ 			</LinearLayout>
+ 		</FrameLayout>
+ 
+diff --git a/app_mojo/src/main/res/layout/dialog_quick_setting.xml b/app_mojo/src/main/res/layout/dialog_quick_setting.xml
+index 9a20050fa291673a596923fcd69a8de2a5d8e6ab..9b59ae52eda4602714b9b3721169a6a6065b50e1 100644
+--- a/app_mojo/src/main/res/layout/dialog_quick_setting.xml
++++ b/app_mojo/src/main/res/layout/dialog_quick_setting.xml
+@@ -45,73 +45,6 @@
+         app:layout_constraintEnd_toEndOf="parent"
+         app:layout_constraintTop_toTopOf="@id/editResolution_textView" />
+ 
+-    <!-- Gyroscope settings -->
+-    <androidx.appcompat.widget.SwitchCompat
+-        android:id="@+id/checkboxGyro"
+-        android:layout_width="match_parent"
+-        android:layout_height="@dimen/_36sdp"
+-        android:text="@string/preference_enable_gyro_title"
+-
+-        app:layout_constraintStart_toStartOf="parent"
+-        app:layout_constraintTop_toBottomOf="@id/editResolution_seekbar"/>
+-
+-    <androidx.appcompat.widget.SwitchCompat
+-        android:id="@+id/checkboxGyroX"
+-        android:layout_width="match_parent"
+-        android:layout_height="@dimen/_36sdp"
+-        android:text="@string/preference_gyro_invert_x_axis"
+-
+-        app:layout_constraintStart_toStartOf="parent"
+-        app:layout_constraintTop_toBottomOf="@id/checkboxGyro"/>
+-
+-    <androidx.appcompat.widget.SwitchCompat
+-        android:id="@+id/checkboxGyroY"
+-        android:layout_width="match_parent"
+-        android:layout_height="@dimen/_36sdp"
+-        android:text="@string/preference_gyro_invert_y_axis"
+-
+-        app:layout_constraintStart_toStartOf="parent"
+-        app:layout_constraintTop_toBottomOf="@id/checkboxGyroX"/>
+-
+-    <!-- Gyroscope sensitivity -->
+-    <TextView
+-        android:id="@+id/editGyro_textView"
+-        android:layout_width="wrap_content"
+-        android:layout_height="wrap_content"
+-        android:layout_marginTop="@dimen/_5sdp"
+-        android:gravity="center"
+-        android:paddingEnd="5dp"
+-        android:text="@string/preference_gyro_sensitivity_title"
+-
+-        app:layout_constraintStart_toStartOf="parent"
+-        app:layout_constraintTop_toBottomOf="@id/checkboxGyroY" />
+-
+-    <com.kdt.CustomSeekbar
+-        android:id="@+id/editGyro_seekbar"
+-        android:layout_width="0dp"
+-        android:layout_height="@dimen/_36sdp"
+-
+-        android:min="@integer/gyro_speed_seekbar_min"
+-        android:max="@integer/gyro_speed_seekbar_max"
+-        app:seekBarIncrement="@integer/gyro_speed_seekbar_increment"
+-
+-        app:layout_constraintEnd_toEndOf="parent"
+-        app:layout_constraintHorizontal_bias="0.538"
+-        app:layout_constraintStart_toStartOf="parent"
+-        app:layout_constraintTop_toBottomOf="@+id/editGyro_textView" />
+-
+-    <TextView
+-        android:id="@+id/editGyro_textView_percent"
+-        android:layout_width="150dp"
+-        android:layout_height="0dp"
+-        android:gravity="end"
+-        tools:text="100%"
+-
+-        app:layout_constraintBottom_toBottomOf="@id/editGyro_textView"
+-        app:layout_constraintEnd_toEndOf="parent"
+-        app:layout_constraintTop_toTopOf="@id/editGyro_textView" />
+-
+-
+     <!-- Mouse settings -->
+     <TextView
+         android:id="@+id/editMouseSpeed_textView"
+@@ -123,7 +56,7 @@
+         android:text="@string/mcl_setting_title_mousespeed"
+ 
+         app:layout_constraintStart_toStartOf="parent"
+-        app:layout_constraintTop_toBottomOf="@id/editGyro_seekbar" />
++        app:layout_constraintTop_toBottomOf="@id/editResolution_seekbar" />
+ 
+     <com.kdt.CustomSeekbar
+         android:id="@+id/editMouseSpeed_seekbar"
+diff --git a/app_mojo/src/main/res/layout/fragment_launcher.xml b/app_mojo/src/main/res/layout/fragment_launcher.xml
+index 1481fb91f563ca2dd1c2dc91db3a9723d026c4f8..2014890554c39dadce1db213395229710db42772 100644
+--- a/app_mojo/src/main/res/layout/fragment_launcher.xml
++++ b/app_mojo/src/main/res/layout/fragment_launcher.xml
+@@ -48,138 +48,182 @@
+ 				android:textSize="14sp" />
+ 
+ 			<LinearLayout
+-				android:layout_width="match_parent"
+-				android:layout_height="wrap_content"
+-				android:layout_marginTop="28dp"
+-				android:orientation="horizontal">
+-
+-            <LinearLayout
+-                android:id="@+id/install_jar_button"
+-                android:layout_width="0dp"
+-                android:layout_height="104dp"
+-                android:layout_weight="1"
+-                android:layout_marginStart="0dp"
+-                android:layout_marginEnd="6dp"
+-                android:background="@drawable/bg_home_card"
+-                android:clickable="true"
+-                android:focusable="true"
+-                android:gravity="center"
+-                android:orientation="vertical">
+-
+-                <ImageView
+-                    android:layout_width="36dp"
+-                    android:layout_height="36dp"
+-                    android:importantForAccessibility="no"
+-                    android:src="@drawable/ic_px_java_run"
+-                    android:tint="#91DFFB" />
+-
+-                <TextView
+-                    android:layout_width="wrap_content"
+-                    android:layout_height="wrap_content"
+-                    android:layout_marginTop="8dp"
+-                    android:text="Mods"
+-                    android:textColor="#FFFFFF"
+-                    android:textSize="14sp"
+-                    android:textStyle="bold" />
+-            </LinearLayout>
+-
+-            <LinearLayout
+-                android:id="@+id/custom_control_button"
+-                android:layout_width="0dp"
+-                android:layout_height="104dp"
+-                android:layout_weight="1"
+-                android:layout_marginStart="6dp"
+-                android:layout_marginEnd="0dp"
+-                android:background="@drawable/bg_home_card"
+-                android:clickable="true"
+-                android:focusable="true"
+-                android:gravity="center"
+-                android:orientation="vertical">
+-
+-                <ImageView
+-                    android:layout_width="36dp"
+-                    android:layout_height="36dp"
+-                    android:importantForAccessibility="no"
+-                    android:src="@drawable/ic_px_gamepad"
+-                    android:tint="#91DFFB" />
+-
+-                <TextView
+-                    android:layout_width="wrap_content"
+-                    android:layout_height="wrap_content"
+-                    android:layout_marginTop="8dp"
+-                    android:text="Controls"
+-                    android:textColor="#FFFFFF"
+-                    android:textSize="14sp"
+-                    android:textStyle="bold" />
+-            </LinearLayout>
++			    android:layout_width="match_parent"
++			    android:layout_height="wrap_content"
++			    android:layout_marginTop="28dp"
++			    android:orientation="horizontal">
++
++				<LinearLayout
++				    android:id="@+id/install_jar_button"
++				    android:layout_width="0dp"
++				    android:layout_height="104dp"
++				    android:layout_weight="1"
++				    android:layout_marginStart="0dp"
++				    android:layout_marginEnd="6dp"
++				    android:background="@drawable/bg_home_card"
++				    android:clickable="true"
++				    android:focusable="true"
++				    android:gravity="center"
++				    android:orientation="vertical">
++
++				    <ImageView
++				        android:layout_width="36dp"
++				        android:layout_height="36dp"
++				        android:importantForAccessibility="no"
++				        android:src="@drawable/ic_px_java_run"
++				        android:tint="#91DFFB" />
++
++				    <TextView
++				        android:layout_width="wrap_content"
++				        android:layout_height="wrap_content"
++				        android:layout_marginTop="8dp"
++				        android:text="Mods"
++				        android:textColor="#FFFFFF"
++				        android:textSize="14sp"
++				        android:textStyle="bold" />
++				</LinearLayout>
++
++				<LinearLayout
++				    android:id="@+id/resource_packs_button"
++				    android:layout_width="0dp"
++				    android:layout_height="104dp"
++				    android:layout_weight="1"
++				    android:layout_marginStart="6dp"
++				    android:layout_marginEnd="0dp"
++				    android:background="@drawable/bg_home_card"
++				    android:clickable="true"
++				    android:focusable="true"
++				    android:gravity="center"
++				    android:orientation="vertical">
++
++				    <ImageView
++				        android:layout_width="36dp"
++				        android:layout_height="36dp"
++				        android:importantForAccessibility="no"
++				        android:src="@drawable/ic_px_image"
++				        android:tint="#91DFFB" />
++
++				    <TextView
++				        android:layout_width="wrap_content"
++				        android:layout_height="wrap_content"
++				        android:layout_marginTop="8dp"
++				        android:text="Resource packs"
++				        android:textColor="#FFFFFF"
++				        android:textSize="14sp"
++				        android:textStyle="bold" />
++				</LinearLayout>
+ 
+ 			</LinearLayout>
+ 
+ 			<LinearLayout
+-				android:layout_width="match_parent"
+-				android:layout_height="wrap_content"
+-				android:layout_marginTop="12dp"
+-				android:orientation="horizontal">
+-
+-            <LinearLayout
+-                android:id="@+id/open_files_button"
+-                android:layout_width="0dp"
+-                android:layout_height="104dp"
+-                android:layout_weight="1"
+-                android:layout_marginStart="0dp"
+-                android:layout_marginEnd="6dp"
+-                android:background="@drawable/bg_home_card"
+-                android:clickable="true"
+-                android:focusable="true"
+-                android:gravity="center"
+-                android:orientation="vertical">
+-
+-                <ImageView
+-                    android:layout_width="36dp"
+-                    android:layout_height="36dp"
+-                    android:importantForAccessibility="no"
+-                    android:src="@drawable/ic_px_folder"
+-                    android:tint="#91DFFB" />
+-
+-                <TextView
+-                    android:layout_width="wrap_content"
+-                    android:layout_height="wrap_content"
+-                    android:layout_marginTop="8dp"
+-                    android:text="Files"
+-                    android:textColor="#FFFFFF"
+-                    android:textSize="14sp"
+-                    android:textStyle="bold" />
+-            </LinearLayout>
+-
+-            <LinearLayout
+-                android:id="@+id/share_logs_button"
+-                android:layout_width="0dp"
+-                android:layout_height="104dp"
+-                android:layout_weight="1"
+-                android:layout_marginStart="6dp"
+-                android:layout_marginEnd="0dp"
+-                android:background="@drawable/bg_home_card"
+-                android:clickable="true"
+-                android:focusable="true"
+-                android:gravity="center"
+-                android:orientation="vertical">
+-
+-                <ImageView
+-                    android:layout_width="36dp"
+-                    android:layout_height="36dp"
+-                    android:importantForAccessibility="no"
+-                    android:src="@drawable/ic_px_sharelog"
+-                    android:tint="#91DFFB" />
+-
+-                <TextView
+-                    android:layout_width="wrap_content"
+-                    android:layout_height="wrap_content"
+-                    android:layout_marginTop="8dp"
+-                    android:text="Logs"
+-                    android:textColor="#FFFFFF"
+-                    android:textSize="14sp"
+-                    android:textStyle="bold" />
+-            </LinearLayout>
++			    android:layout_width="match_parent"
++			    android:layout_height="wrap_content"
++			    android:layout_marginTop="12dp"
++			    android:orientation="horizontal">
++
++				<LinearLayout
++				    android:id="@+id/custom_control_button"
++				    android:layout_width="0dp"
++				    android:layout_height="104dp"
++				    android:layout_weight="1"
++				    android:layout_marginStart="0dp"
++				    android:layout_marginEnd="6dp"
++				    android:background="@drawable/bg_home_card"
++				    android:clickable="true"
++				    android:focusable="true"
++				    android:gravity="center"
++				    android:orientation="vertical">
++
++				    <ImageView
++				        android:layout_width="36dp"
++				        android:layout_height="36dp"
++				        android:importantForAccessibility="no"
++				        android:src="@drawable/ic_px_gamepad"
++				        android:tint="#91DFFB" />
++
++				    <TextView
++				        android:layout_width="wrap_content"
++				        android:layout_height="wrap_content"
++				        android:layout_marginTop="8dp"
++				        android:text="Controls"
++				        android:textColor="#FFFFFF"
++				        android:textSize="14sp"
++				        android:textStyle="bold" />
++				</LinearLayout>
++
++				<LinearLayout
++				    android:id="@+id/open_files_button"
++				    android:layout_width="0dp"
++				    android:layout_height="104dp"
++				    android:layout_weight="1"
++				    android:layout_marginStart="6dp"
++				    android:layout_marginEnd="0dp"
++				    android:background="@drawable/bg_home_card"
++				    android:clickable="true"
++				    android:focusable="true"
++				    android:gravity="center"
++				    android:orientation="vertical">
++
++				    <ImageView
++				        android:layout_width="36dp"
++				        android:layout_height="36dp"
++				        android:importantForAccessibility="no"
++				        android:src="@drawable/ic_px_folder"
++				        android:tint="#91DFFB" />
++
++				    <TextView
++				        android:layout_width="wrap_content"
++				        android:layout_height="wrap_content"
++				        android:layout_marginTop="8dp"
++				        android:text="Files"
++				        android:textColor="#FFFFFF"
++				        android:textSize="14sp"
++				        android:textStyle="bold" />
++				</LinearLayout>
++
++			</LinearLayout>
++
++			<LinearLayout
++			    android:layout_width="match_parent"
++			    android:layout_height="wrap_content"
++			    android:layout_marginTop="12dp"
++			    android:orientation="horizontal">
++
++				<LinearLayout
++				    android:id="@+id/share_logs_button"
++				    android:layout_width="0dp"
++				    android:layout_height="104dp"
++				    android:layout_weight="1"
++				    android:layout_marginStart="0dp"
++				    android:layout_marginEnd="6dp"
++				    android:background="@drawable/bg_home_card"
++				    android:clickable="true"
++				    android:focusable="true"
++				    android:gravity="center"
++				    android:orientation="vertical">
++
++				    <ImageView
++				        android:layout_width="36dp"
++				        android:layout_height="36dp"
++				        android:importantForAccessibility="no"
++				        android:src="@drawable/ic_px_sharelog"
++				        android:tint="#91DFFB" />
++
++				    <TextView
++				        android:layout_width="wrap_content"
++				        android:layout_height="wrap_content"
++				        android:layout_marginTop="8dp"
++				        android:text="Logs"
++				        android:textColor="#FFFFFF"
++				        android:textSize="14sp"
++				        android:textStyle="bold" />
++				</LinearLayout>
++
++				<View
++				    android:layout_width="0dp"
++				    android:layout_height="1dp"
++				    android:layout_weight="1"
++				    android:layout_marginStart="6dp" />
+ 
+ 			</LinearLayout>
+ 		</LinearLayout>
+diff --git a/app_mojo/src/main/res/values-ar/strings.xml b/app_mojo/src/main/res/values-ar/strings.xml
+index 754b91de5f44dfcc44701182138e31dc53a23753..c023022735cf3b1c47048c11e68f5d7c2f965f95 100644
+--- a/app_mojo/src/main/res/values-ar/strings.xml
++++ b/app_mojo/src/main/res/values-ar/strings.xml
+@@ -184,14 +184,7 @@
+     <string name="preference_force_english_description">يسمح لك برؤية النصوص الأصلية، كما أرادها المطورون. يتطلب إعادة التشغيل.</string>
+     <string name="preference_edit_controls_title">تعديل مخطط التحكم</string>
+     <string name="preference_edit_controls_summary">عدل مخطط التحكم لتلبي احتياجاتك.</string>
+-    <string name="preference_category_gyro_controls">تحكم باستخدام الجايروسكوب</string>
+     <string name="preference_category_virtual_mouse">الفأرة الافتراضية</string>
+-    <string name="preference_gyro_invert_x_axis">عكس المحور الأفقي</string>
+-    <string name="preference_gyro_invert_y_axis">عكس المحور العمودي</string>
+-    <string name="preference_gyro_invert_x_axis_description">اعكس المحور الأفقي.</string>
+-    <string name="preference_gyro_invert_y_axis_description">اعكس المحور العمودي.</string>
+-    <string name="preference_gyro_smoothing_title">فعل تسليس حركة الجايروسكوب</string>
+-    <string name="preference_gyro_smoothing_description">سلاسة اكثر مقابل التأخير.</string>
+     <string name="preference_back_title">العودة إلى الشاشة الأخيرة</string>
+     <string name="unnamed">غير مسمى</string>
+     <string name="profiles_latest_snapshot">آخر لمحة (سنابشوت)</string>
+@@ -224,13 +217,6 @@
+     <string name="xerr_child">حسابك هو حساب طفل، ويجب إضافته إلى العائلة لتسجيل الدخول.</string>
+ 
+     <string name="xerr_not_available">Xbox Live غير متوفر في بلدك</string>
+-    <string name="preference_enable_gyro_title">تمكين التحكم بالجيروسكوب</string>
+-    <string name="preference_enable_gyro_description">هذا الخيار سيجعلك تتحرك باللعبة عن طريق تحريك هاتفك.</string>
+-    <string name="preference_gyro_sensitivity_title">حساسية التحكم في الغيروسكوب</string>
+-    <string name="preference_gyro_sensitivity_description">عدل حساسية تحكم الجايروسكوب.</string>
+-    <string name="toast_turn_on_gyro">فعل الجايروسكوب اولاً!</string>
+-    <string name="preference_gyro_sample_rate_title">معدل أخذ العينات من الجايرسكوب</string>
+-    <string name="preference_gyro_sample_rate_description">اذا كان لديك مشاكل أداء في الجايروسكوب، زد هذا الخيار.</string>
+     <string name="microsoft_login_retry_later">طلبات كثيرة جداً، الرجاء المحاولة مرة أخرى لاحقاً.</string>
+     <string name="storage_required">يتطلب MJLauncher أن تكون وحدة التخزين الخارجية متصلة. الرجاء إعادة الاتصال بها وإعادة تشغيل التطبيق.</string>
+     <string name="mcl_setting_title_buttonallcaps">استخدم الأحرف الكبيرة فقط في اسماء الأزرار</string>
+diff --git a/app_mojo/src/main/res/values-az-rAZ/strings.xml b/app_mojo/src/main/res/values-az-rAZ/strings.xml
+index d1b36b372edf2c486473985f36331d55831d1f88..0ae0d7b944d051bd15b222e2b7623b542876f5e5 100644
+--- a/app_mojo/src/main/res/values-az-rAZ/strings.xml
++++ b/app_mojo/src/main/res/values-az-rAZ/strings.xml
+@@ -179,14 +179,7 @@
+     <string name="preference_force_english_description">Tərtibatçılar tərəfindən nəzərdə tutulduğu kimi orijinal sətirləri görməyə imkan verir. Yenidən başlamağı tələb edir.</string>
+     <string name="preference_edit_controls_title">Fərdi idarəetmələri redaktə edin</string>
+     <string name="preference_edit_controls_summary">İdarəetmə sxemini ehtiyaclarınıza uyğunlaşdırın.</string>
+-    <string name="preference_category_gyro_controls">Giroskop kontrolları</string>
+     <string name="preference_category_virtual_mouse">Virtual siçan</string>
+-    <string name="preference_gyro_invert_x_axis">X oxunu çevirin</string>
+-    <string name="preference_gyro_invert_y_axis">Y oxunu çevirin</string>
+-    <string name="preference_gyro_invert_x_axis_description">Üfüqi oxu tərsinə çevirin.</string>
+-    <string name="preference_gyro_invert_y_axis_description">Şaquli oxu tərsinə çevirin.</string>
+-    <string name="preference_gyro_smoothing_title">Giroskop hamarlamağı aktivləşdirin</string>
+-    <string name="preference_gyro_smoothing_description">Gecikmə qarşılığında titrəməni azaldın.</string>
+     <string name="preference_back_title">Son ekrana qayıdın</string>
+     <string name="unnamed">Adsız</string>
+     <string name="profiles_latest_snapshot">Ən son snapshot</string>
+@@ -219,13 +212,6 @@
+     <string name="xerr_child">Hesabınız uşaq hesabıdır və daxil olmaq üçün Ailəyə əlavə edilməlidir.</string>
+ 
+     <string name="xerr_not_available">Xbox Live ölkənizdə mövcud deyil</string>
+-    <string name="preference_enable_gyro_title">Gyroskop nəzarətlərini aktivləşdirin</string>
+-    <string name="preference_enable_gyro_description">Bunu aktivləşdirmək sizə telefonunuzu çevirərək oyundaxili dönmə eməyə imkan verəcək.</string>
+-    <string name="preference_gyro_sensitivity_title">Gyroskop həssaslığını idarə edin</string>
+-    <string name="preference_gyro_sensitivity_description">Giroskop nəzarətlərinin həssaslığını tənzimləyin.</string>
+-    <string name="toast_turn_on_gyro">Bunu istifadə etmək üçün əvvəlcə giroskop nəzarətlərini aktiv edin!</string>
+-    <string name="preference_gyro_sample_rate_title">Gyroskopdan nümunə götürmə dərəcəsi</string>
+-    <string name="preference_gyro_sample_rate_description">Giroskop idarəetmələri ilə bağlı performans probleminiz varsa, bunu artırın.</string>
+     <string name="microsoft_login_retry_later">Həddindən artıq sorğu var, sonra yenidən cəhd edin.</string>
+     <string name="storage_required">MJLauncher xarici yaddaşın əlavə edilməsini tələb edir. Lütfən, onu yenidən qoşun və proqramı yenidən başladın.</string>
+     <string name="mcl_setting_title_buttonallcaps">Düymə etiketlərində yalnız böyük hərflərdən istifadə edin</string>
+diff --git a/app_mojo/src/main/res/values-bn-rBD/strings.xml b/app_mojo/src/main/res/values-bn-rBD/strings.xml
+index f2bfd82a6a95765bebba99f9908365c799ff225f..6cc690dee25a381ce850201476e49a1cab2393d6 100644
+--- a/app_mojo/src/main/res/values-bn-rBD/strings.xml
++++ b/app_mojo/src/main/res/values-bn-rBD/strings.xml
+@@ -218,14 +218,7 @@
+     <string name="preference_force_english_description">ডেভেলপারদের নির্ধারিত মূল স্ট্রিং দেখাবে। রিস্টার্ট প্রয়োজন।</string>
+     <string name="preference_edit_controls_title">কাস্টম কন্ট্রোল সম্পাদনা করুন</string>
+     <string name="preference_edit_controls_summary">আপনার প্রয়োজন অনুযায়ী কন্ট্রোল স্কিম টুইক করুন।</string>
+-    <string name="preference_category_gyro_controls">জাইরোস্কোপ কন্ট্রোল</string>
+     <string name="preference_category_virtual_mouse">ভার্চুয়াল মাউস</string>
+-    <string name="preference_gyro_invert_x_axis">X অক্ষ উল্টান</string>
+-    <string name="preference_gyro_invert_y_axis">Y অক্ষ উল্টান</string>
+-    <string name="preference_gyro_invert_x_axis_description">অনুভূমিক অক্ষ উল্টান।</string>
+-    <string name="preference_gyro_invert_y_axis_description">উল্লম্ব অক্ষ উল্টান।</string>
+-    <string name="preference_gyro_smoothing_title">জাইরোস্কোপ স্মুথিং চালু করুন</string>
+-    <string name="preference_gyro_smoothing_description">ল্যাটেন্সির বিনিময়ে জিটার কমান।</string>
+     <string name="preference_back_title">শেষ স্ক্রীনে ফিরে যান</string>
+     <string name="unnamed">নামহীন</string>
+     <string name="profiles_latest_snapshot">সর্বশেষ স্ন্যাপশট</string>
+@@ -261,13 +254,6 @@
+     <string name="xerr_child">আপনার অ্যাকাউন্ট শিশু অ্যাকাউন্ট, লগইন করতে Family তে যোগ করতে হবে।</string>
+ 
+     <string name="xerr_not_available">আপনার দেশে Xbox Live উপলব্ধ নয়</string>
+-    <string name="preference_enable_gyro_title">জাইরোস্কোপ কন্ট্রোল চালু করুন</string>
+-    <string name="preference_enable_gyro_description">এটি চালু করলে ফোন ঘুরিয়ে ইন-গেমে ঘুরতে পারবেন।</string>
+-    <string name="preference_gyro_sensitivity_title">জাইরোস্কোপ সেন্সিটিভিটি</string>
+-    <string name="preference_gyro_sensitivity_description">জাইরোস্কোপ কন্ট্রোলের সেন্সিটিভিটি সমন্বয় করুন।</string>
+-    <string name="toast_turn_on_gyro">এটি ব্যবহার করতে আগে জাইরোস্কোপ কন্ট্রোল চালু করুন!</string>
+-    <string name="preference_gyro_sample_rate_title">জাইরোস্কোপ স্যাম্পলিং রেট</string>
+-    <string name="preference_gyro_sample_rate_description">জাইরোস্কোপ কন্ট্রোলে পারফরম্যান্স সমস্যা হলে এটি বাড়ান।</string>
+     <string name="microsoft_login_retry_later">অনেক অনুরোধ করা হয়েছে, অনুগ্রহ করে পরে চেষ্টা করুন।</string>
+     <string name="storage_required">MJLauncher চালানোর জন্য এক্সটার্নাল স্টোরেজ সংযুক্ত করতে হবে। পুনরায় সংযুক্ত করে অ্যাপ রিস্টার্ট করুন।</string>
+     <string name="mcl_setting_title_buttonallcaps">বোতামের লেবেলে কেবল বড় হাতের অক্ষর ব্যবহার করুন</string>
+diff --git a/app_mojo/src/main/res/values-ca/strings.xml b/app_mojo/src/main/res/values-ca/strings.xml
+index 43cb4e176c67ac1d9f0bfd596f795652aeb9f173..0333b608c96e4948910a58035f43653fe30ffbea 100644
+--- a/app_mojo/src/main/res/values-ca/strings.xml
++++ b/app_mojo/src/main/res/values-ca/strings.xml
+@@ -129,13 +129,6 @@
+     <string name="preference_force_english_description">Et permet veure les cadenes de text originals, com volen els desenvolupadors. Cal reiniciar.</string>
+     <string name="preference_edit_controls_title">Edita controls personalitzats</string>
+     <string name="preference_edit_controls_summary">Canvia l\'esquema de control perquè s\'ajusti a les teves necessitats.</string>
+-    <string name="preference_category_gyro_controls">Controls de giroscopi</string>
+-    <string name="preference_gyro_invert_x_axis">Invertir l\'axis X</string>
+-    <string name="preference_gyro_invert_y_axis">Invertir l\'axis Y</string>
+-    <string name="preference_gyro_invert_x_axis_description">Invertir l\'axis horitzontal.</string>
+-    <string name="preference_gyro_invert_y_axis_description">Invertir l\'axis vertical.</string>
+-    <string name="preference_gyro_smoothing_title">Activa el suavitzador del giroscopi</string>
+-    <string name="preference_gyro_smoothing_description">Redueix el \"jitter\" a canvi de latència.</string>
+     <string name="preference_back_title">Torna a l\'última pantalla</string>
+     <string name="unnamed">Sense nom</string>
+     <string name="profiles_latest_snapshot">Última snapshot</string>
+@@ -167,13 +160,6 @@
+     <string name="xerr_child">El teu compte és un compte d\'infants, i s\'ha d\'afegir a una Família per poder iniciar la sessió.</string>
+ 
+     <string name="xerr_not_available">El Xbox Live no està disponible al seu país</string>
+-    <string name="preference_enable_gyro_title">Activa els controls del giroscopi</string>
+-    <string name="preference_enable_gyro_description">Activar açò permetrà girar-se en el joc girant el telèfon.</string>
+-    <string name="preference_gyro_sensitivity_title">Sensibilitat de controls del giroscopi</string>
+-    <string name="preference_gyro_sensitivity_description">Ajusta la sensibilitat dels controls del giroscopi.</string>
+-    <string name="toast_turn_on_gyro">Primer has d\'activar els controls del giroscopi!</string>
+-    <string name="preference_gyro_sample_rate_title">Tassa d\'actualització del giroscopi</string>
+-    <string name="preference_gyro_sample_rate_description">Si tens problemes de rendiment amb el giroscopi, puja aquest valor.</string>
+     <string name="microsoft_login_retry_later">Massa peticions, si us plau, torneu-ho a intentar més tard.</string>
+     <string name="storage_required">El MJLauncher requereix que hi hagi emmagatzemament extern connectat. Si us plau, reconnecteu-ho i reinicieu l\'app.</string>
+     <string name="of_dl_progress">Downloading %s</string>
+diff --git a/app_mojo/src/main/res/values-cs/strings.xml b/app_mojo/src/main/res/values-cs/strings.xml
+index 5988cbba0393d96f47c73fae163c5601486d142e..00537982ff640f9a0a6fe9155b76775ec017a760 100644
+--- a/app_mojo/src/main/res/values-cs/strings.xml
++++ b/app_mojo/src/main/res/values-cs/strings.xml
+@@ -184,14 +184,7 @@
+     <string name="preference_force_english_description">Umožňuje mít původní text, tak jak byl zamýšlen vývojáři. Vyžaduje restart.</string>
+     <string name="preference_edit_controls_title">Upravit vlastní ovládací prvky</string>
+     <string name="preference_edit_controls_summary">Vylaďte ovládání dle vašich potřeb.</string>
+-    <string name="preference_category_gyro_controls">Ovládání gyroskopem</string>
+     <string name="preference_category_virtual_mouse">Virtuální myš</string>
+-    <string name="preference_gyro_invert_x_axis">Invertovat osu X</string>
+-    <string name="preference_gyro_invert_y_axis">Invertovat osu Y</string>
+-    <string name="preference_gyro_invert_x_axis_description">Invertovat vodorovnou osu.</string>
+-    <string name="preference_gyro_invert_y_axis_description">Invertovat svislou osu.</string>
+-    <string name="preference_gyro_smoothing_title">Povolit vyhlazování gyroskopu</string>
+-    <string name="preference_gyro_smoothing_description">Snížit třesení vyměnou za zvýšení latence.</string>
+     <string name="preference_back_title">Zpět na předchozí obrazovku</string>
+     <string name="unnamed">Bez názvu</string>
+     <string name="profiles_latest_snapshot">Poslední snapshot</string>
+@@ -224,13 +217,6 @@
+     <string name="xerr_child">Váš účet je dětský, tudíž je potřeba jej přidat do Family pro přihlášení.</string>
+ 
+     <string name="xerr_not_available">Xbox Live není ve vaší zemi dostupné</string>
+-    <string name="preference_enable_gyro_title">Zapnout gyroskopové ovládání</string>
+-    <string name="preference_enable_gyro_description">Zapnutí vám umožní se otáčet ve hře otáčením telefonu.</string>
+-    <string name="preference_gyro_sensitivity_title">Citlivost gyroskopového ovládání</string>
+-    <string name="preference_gyro_sensitivity_description">Upravit citlivost gyroskopového ovládání.</string>
+-    <string name="toast_turn_on_gyro">Pro použití tohoto zapněte gyroskopové ovládání!</string>
+-    <string name="preference_gyro_sample_rate_title">Vzorkovací kmitočet gyroskopu</string>
+-    <string name="preference_gyro_sample_rate_description">Zvyšte toto, máte-li problém s výkonem užívajíce gyroskopového ovládání.</string>
+     <string name="microsoft_login_retry_later">Příliš mnoho požadavků, zkuste to znovu později.</string>
+     <string name="storage_required">MJLauncher vyžaduje přípojené externí úložiště. Připojte jej prosím znovu a restartujte tuto aplikaci.</string>
+     <string name="mcl_setting_title_buttonallcaps">Zobrazovat pouze velká písmena na popiscích tlačítek</string>
+diff --git a/app_mojo/src/main/res/values-de/strings.xml b/app_mojo/src/main/res/values-de/strings.xml
+index daaa1fcede8065feb6280c3587f14c325a9a07bb..058923212df10dd80dee32834598462f4b9686cc 100644
+--- a/app_mojo/src/main/res/values-de/strings.xml
++++ b/app_mojo/src/main/res/values-de/strings.xml
+@@ -184,14 +184,7 @@
+     <string name="preference_force_english_description">Verwendet die originalen Beschriftungen, wie von Entwicklern vorgesehen. Benötigt einen Neustart.</string>
+     <string name="preference_edit_controls_title">Benutzerdefinierte Steuerung bearbeiten</string>
+     <string name="preference_edit_controls_summary">Die Steuerung nach deinen Präferenzen anpassen.</string>
+-    <string name="preference_category_gyro_controls">Gyroskop-Steuerung</string>
+     <string name="preference_category_virtual_mouse">Virtuelle Maus</string>
+-    <string name="preference_gyro_invert_x_axis">X-Achse umkehren</string>
+-    <string name="preference_gyro_invert_y_axis">Y-Achse umkehren</string>
+-    <string name="preference_gyro_invert_x_axis_description">Horizontale Achse umkehren.</string>
+-    <string name="preference_gyro_invert_y_axis_description">Vertikale Achse umkehren.</string>
+-    <string name="preference_gyro_smoothing_title">Gyroskopglättung aktiveren</string>
+-    <string name="preference_gyro_smoothing_description">Reduziert Jitter im Austausch von Latenz.</string>
+     <string name="preference_back_title">Zum vorherigen Menü zurück</string>
+     <string name="unnamed">Unbenannt</string>
+     <string name="profiles_latest_snapshot">Neuste Entwicklungsversion</string>
+@@ -224,13 +217,6 @@
+     <string name="xerr_child">Dein Konto ist ein Kinderkonto und muss in einer Familie hinzugefügt werden, um sich anzumelden.</string>
+ 
+     <string name="xerr_not_available">Xbox-Live ist in deinem Land nicht verfügbar</string>
+-    <string name="preference_enable_gyro_title">Aktiviere Gyroskop-Steuerung</string>
+-    <string name="preference_enable_gyro_description">Aktiviert das Umschauen im Spiel durch das Bewegen des Gerätes.</string>
+-    <string name="preference_gyro_sensitivity_title">Gyroskopsteuerungsempfindlichkeit</string>
+-    <string name="preference_gyro_sensitivity_description">Die Empfindlichkeit der Gyroscope-Steuerung anpassen.</string>
+-    <string name="toast_turn_on_gyro">Gyroscope-Steuerung muss hierfür aktiviert sein!</string>
+-    <string name="preference_gyro_sample_rate_title">Gyroskop-Abtastrate</string>
+-    <string name="preference_gyro_sample_rate_description">Erhöhen bei Leistungsproblemen mit Gyroscope-Steuerung.</string>
+     <string name="microsoft_login_retry_later">Zu viele Anfragen – bitte versuche es später erneut.</string>
+     <string name="storage_required">MJLauncher benötigt einen verbundenen externen Speicher. Bitte verbinde ihn erneut und starte dann die App neu.</string>
+     <string name="mcl_setting_title_buttonallcaps">Nur Großbuchstaben in Tastenbeschriftungen verwenden</string>
+diff --git a/app_mojo/src/main/res/values-el/strings.xml b/app_mojo/src/main/res/values-el/strings.xml
+index c6843b8280980b510a94debcfa2f1d9767c3f66b..2db4c2cf96a214e230e3bf3cc5db9f4e1ff6e967 100644
+--- a/app_mojo/src/main/res/values-el/strings.xml
++++ b/app_mojo/src/main/res/values-el/strings.xml
+@@ -180,14 +180,7 @@
+     <string name="preference_force_english_description">Σας επιτρέπει να δείτε τα αρχικά strings, όπως προορίζονται από τους προγραμματιστές. Απαιτεί επανεκκίνηση.</string>
+     <string name="preference_edit_controls_title">Προσαρμοστεί τα controls</string>
+     <string name="preference_edit_controls_summary">Ρυθμίστε το σύστημα ελέγχου για να ταιριάζει στις ανάγκες σας.</string>
+-    <string name="preference_category_gyro_controls">Έλεγχοι γυροσκοπίου</string>
+     <string name="preference_category_virtual_mouse">Εικονικό ποντίκι</string>
+-    <string name="preference_gyro_invert_x_axis">Αντιστροφή άξονα X</string>
+-    <string name="preference_gyro_invert_y_axis">Αντιστροφή άξονα Y</string>
+-    <string name="preference_gyro_invert_x_axis_description">Αντιστροφή του οριζόντιου άξονα.</string>
+-    <string name="preference_gyro_invert_y_axis_description">Αντιστροφή του κατακόρυφου άξονα.</string>
+-    <string name="preference_gyro_smoothing_title">Ενεργοποίηση εξομάλυνσης γυροσκοπίου</string>
+-    <string name="preference_gyro_smoothing_description">Μείωση jitter σε αντάλλαγμα της καθυστέρησης.</string>
+     <string name="preference_back_title">Επιστροφή στην τελευταία οθόνη</string>
+     <string name="unnamed">Χωρίς όνομα</string>
+     <string name="profiles_latest_snapshot">Τελευταίο στιγμιότυπο</string>
+@@ -220,13 +213,6 @@
+     <string name="xerr_child">Ο λογαριασμός σας είναι ένας λογαριασμός παιδιού, και πρέπει να προστεθεί σε μια οικογένεια για να συνδεθείτε.</string>
+ 
+     <string name="xerr_not_available">Το Xbox Live δεν είναι διαθέσιμο στη χώρα σας</string>
+-    <string name="preference_enable_gyro_title">Ενεργοποίηση εξομάλυνσης γυροσκοπίου</string>
+-    <string name="preference_enable_gyro_description">Ενεργοποιώντας το, θα σας επιτρέψει να γυρίσετε τον χαρακτήρα σας μέσα στο παιχνίδι γυρίζοντας το τηλέφωνό σας.</string>
+-    <string name="preference_gyro_sensitivity_title">Ευαισθησία ελέγχων γυροσκοπίου</string>
+-    <string name="preference_gyro_sensitivity_description">Προσαρμόστε την ευαισθησία των ελέγχων γυροσκοπίου.</string>
+-    <string name="toast_turn_on_gyro">Ενεργοποιήστε πρώτα τα γυροσκοπικά στοιχεία ελέγχου για να το χρησιμοποιήσετε αυτό!</string>
+-    <string name="preference_gyro_sample_rate_title">Ρυθμός δειγματοληψίας γυροσκοπίου</string>
+-    <string name="preference_gyro_sample_rate_description">Εάν έχετε προβλήματα απόδοσης με τους ελέγχους γυροσκοπίου, αυξήστε αυτό.</string>
+     <string name="microsoft_login_retry_later">Πάρα πολλά αιτήματα, παρακαλώ προσπαθήστε ξανά αργότερα.</string>
+     <string name="storage_required">Το MJLauncher απαιτεί την προσάρτηση εξωτερικού χώρου. Παρακαλώ επανασυνδέστε το και επανεκκινήστε την εφαρμογή.</string>
+     <string name="mcl_setting_title_buttonallcaps">Χρησιμοποιήστε μόνο κεφαλαία γράμματα σε ετικέτες κουμπιών</string>
+diff --git a/app_mojo/src/main/res/values-en-rGB/strings.xml b/app_mojo/src/main/res/values-en-rGB/strings.xml
+index 46eb39577feba1f32e0215fe15342262c22062d0..2be20fc06828ecdf9259422116b0676d959ecca2 100644
+--- a/app_mojo/src/main/res/values-en-rGB/strings.xml
++++ b/app_mojo/src/main/res/values-en-rGB/strings.xml
+@@ -179,13 +179,6 @@
+     <string name="preference_force_english_description">Allows you to see original strings, as intended by developers. Requires a restart.</string>
+     <string name="preference_edit_controls_title">Edit custom controls</string>
+     <string name="preference_edit_controls_summary">Tweak the control scheme to fit your needs.</string>
+-    <string name="preference_category_gyro_controls">Gyroscope controls</string>
+-    <string name="preference_gyro_invert_x_axis">Invert X axis</string>
+-    <string name="preference_gyro_invert_y_axis">Invert Y axis</string>
+-    <string name="preference_gyro_invert_x_axis_description">Invert the horizontal axis.</string>
+-    <string name="preference_gyro_invert_y_axis_description">Invert the vertical axis.</string>
+-    <string name="preference_gyro_smoothing_title">Enable gyroscope smoothing</string>
+-    <string name="preference_gyro_smoothing_description">Reduce jitter in exchange of latency.</string>
+     <string name="preference_back_title">Back to the last screen</string>
+     <string name="unnamed">Unnamed</string>
+     <string name="profiles_latest_snapshot">Latest snapshot</string>
+@@ -218,13 +211,6 @@
+     <string name="xerr_child">Your account is a child account, and needs to be added into a Family in order to log in.</string>
+ 
+     <string name="xerr_not_available">Xbox Live is not available in your country</string>
+-    <string name="preference_enable_gyro_title">Enable gyroscope controls</string>
+-    <string name="preference_enable_gyro_description">Enabling this will allow you to turn in-game by turning your phone.</string>
+-    <string name="preference_gyro_sensitivity_title">Gyroscope controls sensitivity</string>
+-    <string name="preference_gyro_sensitivity_description">Adjust the sensitivity of gyroscope controls.</string>
+-    <string name="toast_turn_on_gyro">Enable gyroscope controls first to use this!</string>
+-    <string name="preference_gyro_sample_rate_title">Gyroscope sampling rate</string>
+-    <string name="preference_gyro_sample_rate_description">If you have performance issues with gyroscope controls, increase this.</string>
+     <string name="microsoft_login_retry_later">Too many requests, please try again later.</string>
+     <string name="storage_required">MJLauncher requires external storage to be attached. Please reconnect it and restart the app.</string>
+     <string name="mcl_setting_title_buttonallcaps">Only use capital letters in button labels</string>
+diff --git a/app_mojo/src/main/res/values-es/strings.xml b/app_mojo/src/main/res/values-es/strings.xml
+index 7fd47859d4b0609ebd7ba0c64b51eddaf3a77bca..b4ee7655de01faef132e45cb283d7d28b27fe4d0 100644
+--- a/app_mojo/src/main/res/values-es/strings.xml
++++ b/app_mojo/src/main/res/values-es/strings.xml
+@@ -183,14 +183,7 @@
+     <string name="preference_force_english_description">Le permite ver las cadenas originales, según lo previsto por los desarrolladores. Requiere un reinicio.</string>
+     <string name="preference_edit_controls_title">Editar controles personalizados</string>
+     <string name="preference_edit_controls_summary">Ajusta la configuración de controles para ajustarla a tus necesidades.</string>
+-    <string name="preference_category_gyro_controls">Controles del Giroscopio</string>
+     <string name="preference_category_virtual_mouse">Ratón virtual</string>
+-    <string name="preference_gyro_invert_x_axis">Invertir eje X</string>
+-    <string name="preference_gyro_invert_y_axis">Invertir eje Y</string>
+-    <string name="preference_gyro_invert_x_axis_description">Invertir el eje horizontal.</string>
+-    <string name="preference_gyro_invert_y_axis_description">Invertir el eje vertical.</string>
+-    <string name="preference_gyro_smoothing_title">Activar suavizado del giroscopio</string>
+-    <string name="preference_gyro_smoothing_description">Reduce temblones a cambio de latencia.</string>
+     <string name="preference_back_title">Regresar a la pantalla anterior</string>
+     <string name="unnamed">Sin nombre</string>
+     <string name="profiles_latest_snapshot">Snapshot más reciente</string>
+@@ -223,13 +216,6 @@
+     <string name="xerr_child">Su cuenta es una cuenta de menor y necesita ser añadida a una Familia para poder iniciar sesión.</string>
+ 
+     <string name="xerr_not_available">Xbox Live no está disponible en su país</string>
+-    <string name="preference_enable_gyro_title">Habilitar controles de giroscopio</string>
+-    <string name="preference_enable_gyro_description">Activar esto te permitirá mover la cámara al girar tu teléfono.</string>
+-    <string name="preference_gyro_sensitivity_title">Sensibilidad del giroscopio</string>
+-    <string name="preference_gyro_sensitivity_description">Ajusta la sensibilidad del giroscopio.</string>
+-    <string name="toast_turn_on_gyro">¡Primero debes activar los controles por giroscopio para usar esto!</string>
+-    <string name="preference_gyro_sample_rate_title">Tasa de muestreo del giroscopio</string>
+-    <string name="preference_gyro_sample_rate_description">Si tienes problemas de rendimiento con el giroscopio, sube esto.</string>
+     <string name="microsoft_login_retry_later">Demasiadas solicitudes, inténtalo de nuevo más tarde.</string>
+     <string name="storage_required">MJLauncher necesita que el almacenamiento externo esté conectado, por favor reconéctalo y reinicia la aplicación.</string>
+     <string name="mcl_setting_title_buttonallcaps">Usa únicamente letras mayúsculas en las etiquetas de los botones</string>
+diff --git a/app_mojo/src/main/res/values-fa-rIR/strings.xml b/app_mojo/src/main/res/values-fa-rIR/strings.xml
+index 23aa5a6961b16caf2032cc463a762dc607537a7c..4a438f11a17eb91bbd80afa2f3c1d8131534f2ef 100644
+--- a/app_mojo/src/main/res/values-fa-rIR/strings.xml
++++ b/app_mojo/src/main/res/values-fa-rIR/strings.xml
+@@ -175,11 +175,7 @@
+     <string name="preference_force_english_description">به شما اجازه میدهد متون اصلی ارائه شده توسط توسعه دهندگان را ببینید. نیاز به اجرای برنامه.</string>
+     <string name="preference_edit_controls_title">ویرایش کنترل های شخصی</string>
+     <string name="preference_edit_controls_summary">طرح کنترل را متناسب با نیازهای خود تغییر دهید.</string>
+-    <string name="preference_category_gyro_controls">کنترل با ژیروسکوپ</string>
+     <string name="preference_category_virtual_mouse">ماوس مجازی</string>
+-    <string name="preference_gyro_invert_x_axis">محور X را معکوس کنید</string>
+-    <string name="preference_gyro_invert_y_axis">محور Y را معکوس کنید</string>
+-    <string name="preference_gyro_invert_x_axis_description">محور افقی را معکوس کنید.</string>
+     <string name="preference_back_title">بازگشت به صفحه آخر</string>
+     <string name="unnamed">بی نام</string>
+     <string name="profiles_latest_snapshot">جدیدترین اسنپ شات</string>
+@@ -209,9 +205,6 @@
+     <string name="xerr_child">حساب شما یک حساب کودک است و برای ورود به سیستم باید به حساب خانواده اضافه شود.</string>
+ 
+     <string name="xerr_not_available">ما تو ایرانیم. تحریمیم. با فیلترشکن دوباره وارد شو</string>
+-    <string name="preference_enable_gyro_title">فعال کردن کنترل های ژیروسکوپ</string>
+-    <string name="preference_gyro_sensitivity_title">حساسیت کنترلر های ژیروسکوپ</string>
+-    <string name="preference_gyro_sample_rate_title">نرخ نمونه برداری ژیروسکوپ</string>
+     <string name="forge_dl_no_installer">متأسفانه این نسخه Forge نصب کننده‌ای که پشتیبانی بشود ندارد.</string>
+     <string name="forge_dl_select_version">نسخه Forge را انتخاب کنید</string>
+     <string name="fabric_dl_progress">در حال دانلود %s لودر metadata</string>
+diff --git a/app_mojo/src/main/res/values-fil/strings.xml b/app_mojo/src/main/res/values-fil/strings.xml
+index 066d631344a2c56e3e190f85c16fd2e6050ffdd2..e4d0de2d98d75e47424ad2c098a0125af2aa8361 100644
+--- a/app_mojo/src/main/res/values-fil/strings.xml
++++ b/app_mojo/src/main/res/values-fil/strings.xml
+@@ -138,8 +138,6 @@
+     <string name="preference_sustained_performance_title">I-enable ang sustained performance mode</string>
+     <string name="preference_edit_controls_title">Ibahin ang pasadyang mga kontrol</string>
+     <string name="preference_category_virtual_mouse">Virtual mouse</string>
+-    <string name="preference_gyro_invert_x_axis">Baliktarin ang X axis</string>
+-    <string name="preference_gyro_invert_y_axis">Baliktarin ang Y axis</string>
+     <string name="preference_back_title">Bumalik sa huling screen</string>
+     <string name="unnamed">Walang pangalan</string>
+     <string name="profiles_latest_snapshot">Pinakabagong snapshot</string>
+diff --git a/app_mojo/src/main/res/values-fr/strings.xml b/app_mojo/src/main/res/values-fr/strings.xml
+index f9cd335bb86f2c28a7fadb90277d2983b0174e40..7854d823a6bcf6574f99261ea5dc9d1937d92179 100644
+--- a/app_mojo/src/main/res/values-fr/strings.xml
++++ b/app_mojo/src/main/res/values-fr/strings.xml
+@@ -184,14 +184,7 @@
+     <string name="preference_force_english_description">Permet de voir les chaînes de caractères originales, telles qu\'elles ont été conçues par les développeurs. Nécessite un redémarrage.</string>
+     <string name="preference_edit_controls_title">Modifier les contrôles personnalisés</string>
+     <string name="preference_edit_controls_summary">Ajuster le schéma de contrôles pour répondre à vos besoins.</string>
+-    <string name="preference_category_gyro_controls">Contrôles gyroscopiques</string>
+     <string name="preference_category_virtual_mouse">Souris virtuelle</string>
+-    <string name="preference_gyro_invert_x_axis">Inverser l\'axe X</string>
+-    <string name="preference_gyro_invert_y_axis">Inverser l\'axe Y</string>
+-    <string name="preference_gyro_invert_x_axis_description">Inverser l\'axe horizontal.</string>
+-    <string name="preference_gyro_invert_y_axis_description">Inverser l\'axe vertical.</string>
+-    <string name="preference_gyro_smoothing_title">Activer le lissage du gyroscopique</string>
+-    <string name="preference_gyro_smoothing_description">Réduire le tremblement en échange de latence.</string>
+     <string name="preference_back_title">Retour au dernier écran</string>
+     <string name="unnamed">Sans nom</string>
+     <string name="profiles_latest_snapshot">Dernière snapshot</string>
+@@ -224,13 +217,6 @@
+     <string name="xerr_child">Vous avez un compte enfant, pour vous connecter vous devez être relié à une famille.</string>
+ 
+     <string name="xerr_not_available">Xbox Live n\'est pas disponible dans votre pays</string>
+-    <string name="preference_enable_gyro_title">Activer les contrôles du gyroscope</string>
+-    <string name="preference_enable_gyro_description">L\'activation de cette fonction vous permettra de tourner dans le jeu en tournant votre téléphone.</string>
+-    <string name="preference_gyro_sensitivity_title">Sensibilité des contrôles du gyroscope</string>
+-    <string name="preference_gyro_sensitivity_description">Ajuster la sensibilité des commandes du gyroscope.</string>
+-    <string name="toast_turn_on_gyro">Activez d\'abord les commandes du gyroscope pour l\'utiliser !</string>
+-    <string name="preference_gyro_sample_rate_title">Taux d\'échantillonnage du gyroscope</string>
+-    <string name="preference_gyro_sample_rate_description">Si vous avez des problèmes de performance avec les commandes du gyroscope, augmentez cette valeur.</string>
+     <string name="microsoft_login_retry_later">Trop de requêtes, s\'il vous plaît réessayez plus tard.</string>
+     <string name="storage_required">MJLauncher nécessite que le stockage externe soit connecté. Veuillez le reconnecter et redémarrer l\'application.</string>
+     <string name="mcl_setting_title_buttonallcaps">N\'utilisez que des lettres majuscules dans les libellés des boutons</string>
+diff --git a/app_mojo/src/main/res/values-hi/strings.xml b/app_mojo/src/main/res/values-hi/strings.xml
+index 86e958e5899ecb4d8b02c9f490e78123eda7def6..eb5b2e3203e69a7a6fff3e24774037a7cf2eb4cd 100644
+--- a/app_mojo/src/main/res/values-hi/strings.xml
++++ b/app_mojo/src/main/res/values-hi/strings.xml
+@@ -211,15 +211,8 @@
+     <string name="preference_edit_controls_title">कस्टम कंट्रोल्स एडिट करें</string>
+     <string name="preference_edit_controls_summary">अपनी ज़रूरतों के अनुसार कंट्रोल स्कीम को बदलें।</string>
+ 
+-    <string name="preference_category_gyro_controls">गाइरोस्कोप कंट्रोल्स</string>
+     <string name="preference_category_virtual_mouse">वर्चुअल माउस</string>
+ 
+-    <string name="preference_gyro_invert_x_axis">X-अक्ष उलटा करें</string>
+-    <string name="preference_gyro_invert_y_axis">Y-अक्ष उलटा करें</string>
+-    <string name="preference_gyro_invert_x_axis_description">क्षैतिज अक्ष को उलटा करें।</string>
+-    <string name="preference_gyro_invert_y_axis_description">ऊर्ध्वाधर अक्ष को उलटा करें।</string>
+-    <string name="preference_gyro_smoothing_title">गाइरोस्कोप स्मूथिंग सक्षम करें</string>
+-    <string name="preference_gyro_smoothing_description">लेटेंसी के बदले जिटर कम करें।</string>
+ 
+     <string name="preference_back_title">पिछली स्क्रीन पर वापस जाएँ</string>
+     <string name="unnamed">अनाम</string>
+@@ -258,13 +251,6 @@
+     <string name="xerr_child">आपका अकाउंट एक चाइल्ड अकाउंट है, और लॉगिन करने के लिए इसे एक फैमिली में जोड़ा जाना चाहिए।</string>
+ 
+     <string name="xerr_not_available">Xbox Live आपके देश में उपलब्ध नहीं है</string>
+-    <string name="preference_enable_gyro_title">गाइरोस्कोप कंट्रोल्स सक्षम करें</string>
+-    <string name="preference_enable_gyro_description">इसे सक्षम करने से आप अपने फ़ोन को मोड़कर गेम में घूम सकेंगे।</string>
+-    <string name="preference_gyro_sensitivity_title">गाइरोस्कोप कंट्रोल्स संवेदनशीलता</string>
+-    <string name="preference_gyro_sensitivity_description">गाइरोस्कोप कंट्रोल्स की संवेदनशीलता समायोजित करें।</string>
+-    <string name="toast_turn_on_gyro">इसका उपयोग करने के लिए पहले गाइरोस्कोप कंट्रोल्स सक्षम करें!</string>
+-    <string name="preference_gyro_sample_rate_title">गाइरोस्कोप सैंपलिंग रेट</string>
+-    <string name="preference_gyro_sample_rate_description">अगर आपको गाइरोस्कोप कंट्रोल्स के साथ प्रदर्शन संबंधी समस्याएँ आती हैं, तो इसे बढ़ाएँ।</string>
+     <string name="microsoft_login_retry_later">बहुत ज़्यादा रिक्वेस्ट हैं, कृपया बाद में फिर से प्रयास करें।</string>
+     <string name="storage_required">मोजो लॉन्चर को बाहरी स्टोरेज अटैच होना ज़रूरी है। कृपया इसे फिर से कनेक्ट करें और ऐप रीस्टार्ट करें।</string>
+     <string name="mcl_setting_title_buttonallcaps">बटन लेबल में केवल बड़े अक्षरों का उपयोग करें</string>
+diff --git a/app_mojo/src/main/res/values-in/strings.xml b/app_mojo/src/main/res/values-in/strings.xml
+index c1bbd042f26e0c00e047b3b6858f307fc061234b..d6b62d2140a74da1cf997f7f218dec7bb8229e2f 100644
+--- a/app_mojo/src/main/res/values-in/strings.xml
++++ b/app_mojo/src/main/res/values-in/strings.xml
+@@ -183,14 +183,7 @@
+     <string name="preference_force_english_description">Memperbolehkan anda untuk melihat string asli, seperti kehendak pengembang. Membutuhkan muat ulang.</string>
+     <string name="preference_edit_controls_title">Ubah kontrol kustom</string>
+     <string name="preference_edit_controls_summary">Atur skema kontrol untuk menyesuaikan kebutuhan Anda.</string>
+-    <string name="preference_category_gyro_controls">Kontrol Giro</string>
+     <string name="preference_category_virtual_mouse">Mouse virtual</string>
+-    <string name="preference_gyro_invert_x_axis">Balikkan sumbu X</string>
+-    <string name="preference_gyro_invert_y_axis">Balikkan sumbu Y</string>
+-    <string name="preference_gyro_invert_x_axis_description">Balik sumbu horizontal.</string>
+-    <string name="preference_gyro_invert_y_axis_description">Balik sumbu vertikal.</string>
+-    <string name="preference_gyro_smoothing_title">Aktifkan penghalus Giro</string>
+-    <string name="preference_gyro_smoothing_description">Mengurangi jitter sebagai ganti latensi.</string>
+     <string name="preference_back_title">Kembali ke layar terakhir</string>
+     <string name="unnamed">Tidak dinamai</string>
+     <string name="profiles_latest_snapshot">Snapshot terbaru</string>
+@@ -223,13 +216,6 @@
+     <string name="xerr_child">Akunmu adalah akun anak, dan perlu ditambahkan ke keluarga agar dapat masuk.</string>
+ 
+     <string name="xerr_not_available">Xbox Live tidak tersedia dinegaramu</string>
+-    <string name="preference_enable_gyro_title">Hidupkan kontrol giroskop</string>
+-    <string name="preference_enable_gyro_description">Mengaktifkan ini dapat memperbolehkan anda untuk berputar dengan cara memutar ponsel anda.</string>
+-    <string name="preference_gyro_sensitivity_title">Giroskop mengontrol sensitivitas</string>
+-    <string name="preference_gyro_sensitivity_description">Atur sensitivitas kontrol giroskop.</string>
+-    <string name="toast_turn_on_gyro">Nyalakan kontrol giro sebelum menggunakan ini!</string>
+-    <string name="preference_gyro_sample_rate_title">Tingkat pengambilan sampel giroskop</string>
+-    <string name="preference_gyro_sample_rate_description">Jika anda memiliki masalah perfoma dengan kontrol giroskop, tingkatkan ini.</string>
+     <string name="microsoft_login_retry_later">Terlalu banyak permintaan, coba lagi nanti.</string>
+     <string name="storage_required">MJLauncher membutuhkan penyimpanan eksternal. Mohon untuk dipasang kembali dan merestart aplikasi.</string>
+     <string name="mcl_setting_title_buttonallcaps">Hanya gunakan huruf kapital di label tombol</string>
+diff --git a/app_mojo/src/main/res/values-it/strings.xml b/app_mojo/src/main/res/values-it/strings.xml
+index 7ed495a6c8c79f1e9195df01904ffc84fc1dfede..d15674e350e568029878cf250bcf0d20bd120b42 100644
+--- a/app_mojo/src/main/res/values-it/strings.xml
++++ b/app_mojo/src/main/res/values-it/strings.xml
+@@ -183,14 +183,7 @@
+     <string name="preference_force_english_description">Ti consente di vedere le stringhe originali, come previsto dagli sviluppatori. Richiede un riavvio dell\'app.</string>
+     <string name="preference_edit_controls_title">Modifica i controlli personalizzati</string>
+     <string name="preference_edit_controls_summary">Regola lo schema di controllo per soddisfare le tue esigenze.</string>
+-    <string name="preference_category_gyro_controls">Controlli giroscopio</string>
+     <string name="preference_category_virtual_mouse">Mouse virtuale</string>
+-    <string name="preference_gyro_invert_x_axis">Inverti l\'asse X</string>
+-    <string name="preference_gyro_invert_y_axis">Inverti l\'asse Y</string>
+-    <string name="preference_gyro_invert_x_axis_description">Inverti l\'asse orizzontale.</string>
+-    <string name="preference_gyro_invert_y_axis_description">Inverti l\'asse verticale.</string>
+-    <string name="preference_gyro_smoothing_title">Abilita livellamento giroscopio</string>
+-    <string name="preference_gyro_smoothing_description">Riduci il jitter a discapito della latenza.</string>
+     <string name="preference_back_title">Ritorna alla schermata precedente</string>
+     <string name="unnamed">Senza nome</string>
+     <string name="profiles_latest_snapshot">Ultimo Snapshot</string>
+@@ -223,13 +216,6 @@
+     <string name="xerr_child">Il tuo account è un account bambino e deve essere aggiunto in una famiglia per poter accedere.</string>
+ 
+     <string name="xerr_not_available">Xbox Live non è disponibile nel tuo paese</string>
+-    <string name="preference_enable_gyro_title">Abilita controlli giroscopio</string>
+-    <string name="preference_enable_gyro_description">Attivando questa opzione potrai girare nel gioco girando il telefono.</string>
+-    <string name="preference_gyro_sensitivity_title">Sensibilità giroscopio</string>
+-    <string name="preference_gyro_sensitivity_description">Regola la sensibilità del giroscopio.</string>
+-    <string name="toast_turn_on_gyro">Abilita i controlli del giroscopio prima di usarlo!</string>
+-    <string name="preference_gyro_sample_rate_title">Frequenza di campionamento giroscopio</string>
+-    <string name="preference_gyro_sample_rate_description">Se avete problemi di prestazioni con i controlli del giroscopio, aumentare questo.</string>
+     <string name="microsoft_login_retry_later">Troppe richieste, riprova più tardi.</string>
+     <string name="storage_required">MJLauncher necessita della memoria esterna, connettila e riavvia l\'applicazione</string>
+     <string name="mcl_setting_title_buttonallcaps">Usa solo lettere maiuscole nelle etichette dei pulsanti</string>
+diff --git a/app_mojo/src/main/res/values-iw/strings.xml b/app_mojo/src/main/res/values-iw/strings.xml
+index 119e5ee847df71af12e308800d218c9db0a8f827..032a37ad1cd890f021e401aa4c09288302b4cea5 100644
+--- a/app_mojo/src/main/res/values-iw/strings.xml
++++ b/app_mojo/src/main/res/values-iw/strings.xml
+@@ -172,9 +172,6 @@
+     <string name="preference_force_english_description">מאפשר לך לראות את המחרוזות המקוריות כפי שמתוכנן על ידי המפתחים. דורש הפעלה מחדש.</string>
+     <string name="preference_edit_controls_title">עריכת בקרים מותאמות אישית</string>
+     <string name="preference_edit_controls_summary">כוונן את מערכת הבקרה כך שתתאים לצרכיך.</string>
+-    <string name="preference_category_gyro_controls">בקריי גירוסקופ</string>
+-    <string name="preference_gyro_smoothing_title">אפשר החלקת ג\'ירוסקופ</string>
+-    <string name="preference_gyro_smoothing_description">הפחת רעידות תמורת עיכוב.</string>
+     <string name="preference_back_title">חזרה אל המסך האחרון</string>
+     <string name="unnamed">ללא שם</string>
+     <string name="profiles_latest_snapshot">הסנאפשוט העדכני</string>
+@@ -206,13 +203,6 @@
+     <string name="xerr_child">חשבון שלך הוא חשבון ילדים וצריך להיכנס למשפחה על מנת להיכנס.</string>
+ 
+     <string name="xerr_not_available">Xbox Live אינו זמין במדינה שלך</string>
+-    <string name="preference_enable_gyro_title">אפשר את בקרי הג\'יירוסקופ</string>
+-    <string name="preference_enable_gyro_description">הפעלת זה יאפשר לך להסתובב במשחק על ידי סיבוב הטלפון.</string>
+-    <string name="preference_gyro_sensitivity_title">רגישות בקרי חיישן הכיוון</string>
+-    <string name="preference_gyro_sensitivity_description">כוון את הרגישות של בקרי חיישן כיוון.</string>
+-    <string name="toast_turn_on_gyro">הפעלו קודם את בקרי חיישן הכיוון בכדי להשתמש בזה!</string>
+-    <string name="preference_gyro_sample_rate_title">קצב דגימת חיישן הכיוון</string>
+-    <string name="preference_gyro_sample_rate_description">אם אתם חווים בעיות ביצועים עם בקרי חיישן הכיוון, הגדילו ערך זה.</string>
+     <string name="microsoft_login_retry_later">יותר מדי בקשות, נסו שוב מאוחר יותר.</string>
+     <string name="storage_required">MJLauncher דורש אחסון חיצוני מחובר. אנא חבר אותו מחדש והפעל מחדש את האפליקציה.</string>
+     <string name="mcl_setting_title_buttonallcaps">השתמש באותיות גדולות בלבד בתוויות הכפתורים.</string>
+diff --git a/app_mojo/src/main/res/values-ja/strings.xml b/app_mojo/src/main/res/values-ja/strings.xml
+index 7dca9903b6ed64142dc5274ade46cb3e006edfdd..1e906ce9969099bb41d7724c93787bbbeb1628cf 100644
+--- a/app_mojo/src/main/res/values-ja/strings.xml
++++ b/app_mojo/src/main/res/values-ja/strings.xml
+@@ -155,14 +155,7 @@
+     <string name="preference_force_vsync_title">強制的に垂直同期をオンにする</string>
+     <string name="preference_force_english_title">強制的に言語を英語にする</string>
+     <string name="preference_edit_controls_title">コントロールを編集</string>
+-    <string name="preference_category_gyro_controls">ジャイロコントロール</string>
+     <string name="preference_category_virtual_mouse">仮想マウス</string>
+-    <string name="preference_gyro_invert_x_axis">X軸を反転させる</string>
+-    <string name="preference_gyro_invert_y_axis">Y軸を反転させる</string>
+-    <string name="preference_gyro_invert_x_axis_description">水平軸を反転させる.</string>
+-    <string name="preference_gyro_invert_y_axis_description">縦軸を反転させる.</string>
+-    <string name="preference_gyro_smoothing_title">ジャイロコントロールを滑らかにする</string>
+-    <string name="preference_gyro_smoothing_description">ジッターを減少させる代わりに遅延を増やす。</string>
+     <string name="preference_back_title">最後の画面に戻る</string>
+     <string name="unnamed">名前なし</string>
+     <string name="profiles_latest_snapshot">最新のスナップショット</string>
+@@ -194,9 +187,6 @@
+     <string name="xerr_child">このアカウントは、お子さんのアカウントであり、ログインするためにはファミリーに追加する必要があります。</string>
+ 
+     <string name="xerr_not_available">お住まいの国ではXbox Liveをご利用になれません。</string>
+-    <string name="preference_enable_gyro_title">ジャイロコントロールをオンにする</string>
+-    <string name="preference_gyro_sensitivity_title">ジャイロコントロールの感度</string>
+-    <string name="preference_gyro_sample_rate_title">ジャイロコントロールサンプリングの速度</string>
+     <string name="microsoft_login_retry_later">リクエストが多すぎるため、後でもう一度お試しください。</string>
+     <string name="preference_shader_dump_title">シェーダーダンプをオンにする</string>
+     <string name="percent_format">%d%%</string>
+diff --git a/app_mojo/src/main/res/values-ko/strings.xml b/app_mojo/src/main/res/values-ko/strings.xml
+index 8a8d631b0370c9b3347ae0b3d5733fbc4f6d6693..cb09e94a15aa7ebef729af824cb77b4daa2d883f 100644
+--- a/app_mojo/src/main/res/values-ko/strings.xml
++++ b/app_mojo/src/main/res/values-ko/strings.xml
+@@ -180,14 +180,7 @@
+     <string name="preference_force_english_description">개발자가 의도한 기본 문자열을 보여줍니다. 재시작이 필요합니다.</string>
+     <string name="preference_edit_controls_title">사용자 지정 조작 편집</string>
+     <string name="preference_edit_controls_summary">필요에 맞게 조작을 변경합니다.</string>
+-    <string name="preference_category_gyro_controls">자이로스코프 컨트롤</string>
+     <string name="preference_category_virtual_mouse">가상 마우스</string>
+-    <string name="preference_gyro_invert_x_axis">X축 반전</string>
+-    <string name="preference_gyro_invert_y_axis">Y축 반전</string>
+-    <string name="preference_gyro_invert_x_axis_description">수평축 반전</string>
+-    <string name="preference_gyro_invert_y_axis_description">수직축 반전</string>
+-    <string name="preference_gyro_smoothing_title">부드러운 자이로스코프 활성화</string>
+-    <string name="preference_gyro_smoothing_description">지연 시간 대비 지터 감소</string>
+     <string name="preference_back_title">이전 화면으로</string>
+     <string name="unnamed">이름없음</string>
+     <string name="profiles_latest_snapshot">최신 스냅숏</string>
+@@ -220,13 +213,6 @@
+     <string name="xerr_child">당신의 계정은 아동 계정입니다. 가족 구성원으로 추가되어야 로그인할 수 있습니다.</string>
+ 
+     <string name="xerr_not_available">Xbox Live는 당신의 국가에서 사용할 수 없습니다.</string>
+-    <string name="preference_enable_gyro_title">자이로스코프 컨트롤 활성화</string>
+-    <string name="preference_enable_gyro_description">이것을 활성화하면 휴대폰을 움직여 게임을 돌릴 수 있습니다.</string>
+-    <string name="preference_gyro_sensitivity_title">자이로스코프 감도 조절</string>
+-    <string name="preference_gyro_sensitivity_description">자이로스코프 감도를 조절합니다.</string>
+-    <string name="toast_turn_on_gyro">이것을 사용하려면 자이로스코프를 활성하하세요!</string>
+-    <string name="preference_gyro_sample_rate_title">자이로스코프 샘플링 속도</string>
+-    <string name="preference_gyro_sample_rate_description">자이로스코프 컨트롤을 사용할때 성능 문제가 발생한다면 이것을 높이세요.</string>
+     <string name="microsoft_login_retry_later">요청이 너무 많습니다. 잠시후 다시 시도해 주세요.</string>
+     <string name="storage_required">MJLuancher를 사용하려면 외부 저장소를 연결해야합니다. 다시 연결한 후 앱을 다시 시작하세요.</string>
+     <string name="mcl_setting_title_buttonallcaps">컨트롤 버튼 문자에 대문자만 사용</string>
+diff --git a/app_mojo/src/main/res/values-lol-rAA/strings.xml b/app_mojo/src/main/res/values-lol-rAA/strings.xml
+index bb2c75f0d9541e74a4988d1c30ba26e4667de648..4c8c56a6a983a68b180ba092a7283c6d6921df4e 100644
+--- a/app_mojo/src/main/res/values-lol-rAA/strings.xml
++++ b/app_mojo/src/main/res/values-lol-rAA/strings.xml
+@@ -179,13 +179,6 @@
+     <string name="preference_force_english_description">Allows yu to see original stringz, as intended by developurz. Requirez a restart.</string>
+     <string name="preference_edit_controls_title">Change custom controls</string>
+     <string name="preference_edit_controls_summary">Tweak da control scheme to fit yor needz.</string>
+-    <string name="preference_category_gyro_controls">Moving Phone controls</string>
+-    <string name="preference_gyro_invert_x_axis">Invert Y axis</string>
+-    <string name="preference_gyro_invert_y_axis">Invert X axis</string>
+-    <string name="preference_gyro_invert_x_axis_description">Invert da vertical axis.</string>
+-    <string name="preference_gyro_invert_y_axis_description">Invert da horizontal axis.</string>
+-    <string name="preference_gyro_smoothing_title">Enable moving controls better just like butte\'</string>
+-    <string name="preference_gyro_smoothing_description">Reduce jitter in exchange of latencyz.</string>
+     <string name="preference_back_title">Bak 2 teh last screen</string>
+     <string name="unnamed">No named</string>
+     <string name="profiles_latest_snapshot">last snap shot</string>
+@@ -217,13 +210,6 @@
+     <string name="xerr_child">yor account iz a child account, an needz to be added into a family in ordur to log in.</string>
+ 
+     <string name="xerr_not_available">xbox live iz not available in yur country sowyy</string>
+-    <string name="preference_enable_gyro_title">enable gyroscopz controlz like a pro gamer</string>
+-    <string name="preference_enable_gyro_description">enablin\' dis will allow yu to turn in-game by turnin\' yor phone.</string>
+-    <string name="preference_gyro_sensitivity_title">Gyroscope controls sensitivity like a sigma</string>
+-    <string name="preference_gyro_sensitivity_description">adjust da sensitivity of gyroscopz controlz.</string>
+-    <string name="toast_turn_on_gyro">enable gyroscopz controlz first to use dis!</string>
+-    <string name="preference_gyro_sample_rate_title">Gyroscope sampling rate</string>
+-    <string name="preference_gyro_sample_rate_description">if yu hav purrformance issuez wid gyroscopz controlz, increase dis.</string>
+     <string name="microsoft_login_retry_later">too many requestz, purrlease try again later.</string>
+     <string name="storage_required">pojavlauncher requirez external storage to be attached. purrlease reconnect it an restart da app.</string>
+     <string name="mcl_setting_title_buttonallcaps">only use capital letterz in button labelz</string>
+diff --git a/app_mojo/src/main/res/values-lt/strings.xml b/app_mojo/src/main/res/values-lt/strings.xml
+index b48a28f9e8af2ecb8a53a9e702f700cd279085b6..5832ffe8eb2d5f162cd6adccbb3bae5060b7d0f2 100644
+--- a/app_mojo/src/main/res/values-lt/strings.xml
++++ b/app_mojo/src/main/res/values-lt/strings.xml
+@@ -159,13 +159,7 @@
+     <string name="preference_force_english_title">Perjungti I Anglų kalbą</string>
+     <string name="preference_force_english_description">Leidžia matyti originalų tekstą, kaip numatyta kūrejų. Reikalingas paleidimas iš naujo.</string>
+     <string name="preference_edit_controls_title">Redaguoti kontroliavimą</string>
+-    <string name="preference_category_gyro_controls">Gyroskopo kontrolės</string>
+     <string name="preference_category_virtual_mouse">Virtuali pelė</string>
+-    <string name="preference_gyro_invert_x_axis">Invertuoti X ašį</string>
+-    <string name="preference_gyro_invert_y_axis">Invertuoti Y ašį</string>
+-    <string name="preference_gyro_invert_x_axis_description">Invertuoti horizontaliąją ašį.</string>
+-    <string name="preference_gyro_invert_y_axis_description">Invertuoti vertikaliąją ašį.</string>
+-    <string name="preference_gyro_smoothing_title">Įjunkti gyroskopo išlyginimą</string>
+     <string name="preference_back_title">Atgal į paskutinį ekraną</string>
+     <string name="unnamed">Be pavadinimo</string>
+     <string name="profiles_latest_snapshot">Naujausias Snapshotas</string>
+@@ -194,9 +188,6 @@
+     <string name="xerr_adult_verification">Suaugęs turi patvirtinti jūsų paskyrą.</string>
+ 
+     <string name="xerr_not_available">Xbox Live nėra jūsų šalyje</string>
+-    <string name="preference_enable_gyro_title">Įjungti gyroskopo kontroles</string>
+-    <string name="preference_enable_gyro_description">Įjungus leis pasisukti žaidime pasukant telefoną.</string>
+-    <string name="preference_gyro_sensitivity_title">Gyroskopo kontroliu sensityvumas</string>
+     <string name="microsoft_login_retry_later">Per daug užklausų, pabandykite dar kartą vėliau.</string>
+     <string name="percent_format">%d%%</string>
+     <string name="customctrl_editor_exit_title">Išeinate?</string>
+diff --git a/app_mojo/src/main/res/values-nl/strings.xml b/app_mojo/src/main/res/values-nl/strings.xml
+index dc13d105cf2ad529e3f54bc531e8b30e0440f7b6..52b8d08f6bca5eb99cdcf629040cc9d6a4b7f2bb 100644
+--- a/app_mojo/src/main/res/values-nl/strings.xml
++++ b/app_mojo/src/main/res/values-nl/strings.xml
+@@ -178,12 +178,6 @@
+     <string name="preference_force_english_description">Maakt het mogelijk om originele tekenreeksen te zien, zoals bedoeld door ontwikkelaars. Vereist een herstart.</string>
+     <string name="preference_edit_controls_title">Aangepaste besturing bewerken</string>
+     <string name="preference_edit_controls_summary">Pas het controleschema aan aan uw behoeften aan.</string>
+-    <string name="preference_category_gyro_controls">Gyroscoop besturing</string>
+-    <string name="preference_gyro_invert_x_axis">X-as omkeren</string>
+-    <string name="preference_gyro_invert_y_axis">Y-as omkeren</string>
+-    <string name="preference_gyro_invert_x_axis_description">De horizontale as omkeren.</string>
+-    <string name="preference_gyro_invert_y_axis_description">De verticale as omkeren.</string>
+-    <string name="preference_gyro_smoothing_title">Activeer vloeiende gyroscoop besturing</string>
+     <string name="preference_back_title">Terug naar het laatste scherm</string>
+     <string name="unnamed">Naamloos</string>
+     <string name="profiles_latest_snapshot">Laatste Snapshot</string>
+@@ -215,11 +209,6 @@
+     <string name="xerr_child">Je account is een kind account en moet worden toegevoegd aan een Familie om in te loggen.</string>
+ 
+     <string name="xerr_not_available">Xbox Live is niet beschikbaar in jouw land</string>
+-    <string name="preference_enable_gyro_title">Zet gyroscoop besturing aan</string>
+-    <string name="preference_enable_gyro_description">Door dit in te schakelen kan je in-game inschakelen door je telefoon om te draaien.</string>
+-    <string name="preference_gyro_sensitivity_title">Gyroscoop bediening gevoeligheid</string>
+-    <string name="preference_gyro_sensitivity_description">Pas de gevoeligheid van gyroscoop aan.</string>
+-    <string name="toast_turn_on_gyro">Schakel gyroscoop eerst in om dit te gebruiken!</string>
+     <string name="of_dl_progress">Downloaden %s</string>
+     <string name="generic_debug">Foutoplossing</string>
+     <string name="search_modpack_no_result">Geen modpacks gevonden</string>
+diff --git a/app_mojo/src/main/res/values-pl/strings.xml b/app_mojo/src/main/res/values-pl/strings.xml
+index cab16b4fbd21867b4b67a2457c31f6022d82d438..3b3b3e1f3bf7024350488a6d7d6b27b93d46b537 100644
+--- a/app_mojo/src/main/res/values-pl/strings.xml
++++ b/app_mojo/src/main/res/values-pl/strings.xml
+@@ -184,14 +184,7 @@
+     <string name="preference_force_english_description">Pozwala na wyświetlanie oryginalnych ciągów, zgodnie z przeznaczeniem programistów. Wymaga ponownego uruchomienia.</string>
+     <string name="preference_edit_controls_title">Edycja sterowania</string>
+     <string name="preference_edit_controls_summary">Dostosuj schemat sterowania do swoich potrzeb.</string>
+-    <string name="preference_category_gyro_controls">Sterowanie żyroskopowe</string>
+     <string name="preference_category_virtual_mouse">Wirtualna mysz</string>
+-    <string name="preference_gyro_invert_x_axis">Odwróć oś X</string>
+-    <string name="preference_gyro_invert_y_axis">Odwróć oś Y</string>
+-    <string name="preference_gyro_invert_x_axis_description">Odwróć oś poziomą.</string>
+-    <string name="preference_gyro_invert_y_axis_description">Odwróć oś pionową.</string>
+-    <string name="preference_gyro_smoothing_title">Włącz wygładzanie żyroskopu</string>
+-    <string name="preference_gyro_smoothing_description">Zmniejsz jitter w zamian za opóźnienie.</string>
+     <string name="preference_back_title">Powrót do ostatniego ekranu</string>
+     <string name="unnamed">Bez nazwy</string>
+     <string name="profiles_latest_snapshot">Najnowsza wersja deweloperska</string>
+@@ -224,13 +217,6 @@
+     <string name="xerr_child">Twoje konto jest kontem dziecięcym i musi być dodane to rodziny, aby się zalogować.</string>
+ 
+     <string name="xerr_not_available">Usługa Xbox Live nie jest dostępna w twoim kraju</string>
+-    <string name="preference_enable_gyro_title">Włącz sterowanie żyroskopem</string>
+-    <string name="preference_enable_gyro_description">Włączenie tej opcji pozwoli ci obracać się w grze poprzez przekręcanie telefonu.</string>
+-    <string name="preference_gyro_sensitivity_title">Czułość sterowania żyroskopem</string>
+-    <string name="preference_gyro_sensitivity_description">Dostosuj czułość sterowania żyroskopowego.</string>
+-    <string name="toast_turn_on_gyro">Najpierw włącz sterowanie żyroskopowe, aby tego użyć!</string>
+-    <string name="preference_gyro_sample_rate_title">Częstotliwość próbkowania żyroskopu</string>
+-    <string name="preference_gyro_sample_rate_description">Jeśli masz problemy z wydajnością sterowania żyroskopowego, zwiększ tę wartość.</string>
+     <string name="microsoft_login_retry_later">Zbyt wiele zapytań. Spróbuj ponownie później.</string>
+     <string name="storage_required">MJLauncher wymaga podłączonej pamięci zewnętrznej. Podłącz ją ponownie i zrestartuj aplikację.</string>
+     <string name="mcl_setting_title_buttonallcaps">Używaj tylko dużych liter w etykietach przycisków</string>
+diff --git a/app_mojo/src/main/res/values-pt-rBR/strings.xml b/app_mojo/src/main/res/values-pt-rBR/strings.xml
+index bd0b5bb2d38d6bfa2d1c7c5326fc8bbfaba16506..33a0e1d30d9201d5c9457168936e5ecf0fc28b3e 100644
+--- a/app_mojo/src/main/res/values-pt-rBR/strings.xml
++++ b/app_mojo/src/main/res/values-pt-rBR/strings.xml
+@@ -183,14 +183,7 @@
+     <string name="preference_force_english_description">Permite que você veja frases originais, como esperado por desenvolvedores. Requer uma reinicialização.</string>
+     <string name="preference_edit_controls_title">Editar controles personalizados</string>
+     <string name="preference_edit_controls_summary">Ajuste o esquema de controle para atender às suas necessidades.</string>
+-    <string name="preference_category_gyro_controls">Controles giroscópicos</string>
+     <string name="preference_category_virtual_mouse">Mouse virtual</string>
+-    <string name="preference_gyro_invert_x_axis">Inverter eixo X</string>
+-    <string name="preference_gyro_invert_y_axis">Inverter eixo Y</string>
+-    <string name="preference_gyro_invert_x_axis_description">Inverter o eixo horizontal.</string>
+-    <string name="preference_gyro_invert_y_axis_description">Inverter o eixo vertical.</string>
+-    <string name="preference_gyro_smoothing_title">Ativar suavização do giroscópio</string>
+-    <string name="preference_gyro_smoothing_description">Reduzir jitter por latência.</string>
+     <string name="preference_back_title">Voltar para última tela</string>
+     <string name="unnamed">Sem nome</string>
+     <string name="profiles_latest_snapshot">Última snapshot</string>
+@@ -223,13 +216,6 @@
+     <string name="xerr_child">Sua conta é uma conta de criança, e precisa ser colocada em uma família para poder entrar.</string>
+ 
+     <string name="xerr_not_available">Xbox Live não está disponível em seu país</string>
+-    <string name="preference_enable_gyro_title">Habilitar controles por giroscópio</string>
+-    <string name="preference_enable_gyro_description">Habilitar isto permite que você rotacione do jogo, rotacionando seu celular.</string>
+-    <string name="preference_gyro_sensitivity_title">Sensibilidade de controles por giroscópio</string>
+-    <string name="preference_gyro_sensitivity_description">Ajustar a sensibilidade dos controles por giroscópio.</string>
+-    <string name="toast_turn_on_gyro">Ative os controles por giroscópio primeiro para usar isto!</string>
+-    <string name="preference_gyro_sample_rate_title">Taxa de amostragem do giroscópio</string>
+-    <string name="preference_gyro_sample_rate_description">Se você tiver problemas de desempenho com os controles por giroscópio, aumente isto.</string>
+     <string name="microsoft_login_retry_later">Você fez muitas solicitações. Por favor, tente novamente mais tarde.</string>
+     <string name="storage_required">O MJLauncher requer que o armazenamento externo seja conectado. Por favor, reconecte-o e reinicie o aplicativo.</string>
+     <string name="mcl_setting_title_buttonallcaps">Somente use letras maiúsculas em rótulos de botões</string>
+diff --git a/app_mojo/src/main/res/values-pt/strings.xml b/app_mojo/src/main/res/values-pt/strings.xml
+index 00afe4788599f015b6d26e1ff08eb4bdbeb5b309..71adb68ac6d3aefe175b281f2d50e16c96884f0f 100644
+--- a/app_mojo/src/main/res/values-pt/strings.xml
++++ b/app_mojo/src/main/res/values-pt/strings.xml
+@@ -173,8 +173,6 @@
+     <string name="preference_experimental_description">Use estas coisas com precaução, não são suportadas</string>
+     <string name="preference_sustained_performance_title">Habilitar modo de desempenho constante</string>
+     <string name="preference_edit_controls_title">Editar controlos personalizados</string>
+-    <string name="preference_gyro_invert_x_axis">Inverter eixo X</string>
+-    <string name="preference_gyro_invert_y_axis">Inverter eixo Y</string>
+     <string name="preference_back_title">Voltar à tela anterior</string>
+     <string name="unnamed">Sem Nome</string>
+     <string name="profiles_latest_snapshot">Snapshot mais recente</string>
+diff --git a/app_mojo/src/main/res/values-ro/strings.xml b/app_mojo/src/main/res/values-ro/strings.xml
+index 9107fb4dac49dec9eb80fcee1e20cc56dccd9c2f..bc27bd9adc2ce82afcc58fd06d17b0d24056f113 100644
+--- a/app_mojo/src/main/res/values-ro/strings.xml
++++ b/app_mojo/src/main/res/values-ro/strings.xml
+@@ -141,8 +141,6 @@
+     <string name="preference_experimental_title">Lucruri experimentale</string>
+     <string name="preference_sustained_performance_title">Activează modul de performanță susținută</string>
+     <string name="preference_edit_controls_title">Editare controale personalizate</string>
+-    <string name="preference_gyro_invert_x_axis">Inversează axa X</string>
+-    <string name="preference_gyro_invert_y_axis">Inversează axa Y</string>
+     <string name="preference_back_title">Înapoi la ultimul ecran</string>
+     <string name="unnamed">Fără nume</string>
+     <string name="profiles_latest_snapshot">Ultimul snapshot</string>
+@@ -172,9 +170,6 @@
+     <string name="xerr_child">Contul tau este un cont de copil si trebuie sa fie adaugat intr-o familie pentru a se autentifica.</string>
+ 
+     <string name="xerr_not_available">Xbox Live nu este disponibil în ţara dumneavoastră</string>
+-    <string name="preference_enable_gyro_title">Permite controalele gyroscopului</string>
+-    <string name="preference_gyro_sensitivity_title">Controalele tiroscopului controlează sensibilitatea</string>
+-    <string name="preference_gyro_sample_rate_title">Rata de eşantionare giroscopică</string>
+     <string name="microsoft_login_retry_later">Prea multe solicitări, vă rugăm să încercaţi din nou mai târziu.</string>
+     <string name="preference_shader_dump_title">Activează dumping pentru shader</string>
+     <string name="percent_format">%d%%</string>
+diff --git a/app_mojo/src/main/res/values-ru/strings.xml b/app_mojo/src/main/res/values-ru/strings.xml
+index 92e801f1f7e3f5874ef3a0b4a4f4bf31d6c55be1..f22f0169fab9c512fabfcb96750bd7f3a5641df8 100644
+--- a/app_mojo/src/main/res/values-ru/strings.xml
++++ b/app_mojo/src/main/res/values-ru/strings.xml
+@@ -171,14 +171,7 @@
+     <string name="preference_force_english_description">Позволяет увидеть оригинальные строки такими, какими их задумали разработчики. Требуется перезапуск.</string>
+     <string name="preference_edit_controls_title">Изменить раскладку</string>
+     <string name="preference_edit_controls_summary">Настройте кнопки управления по вашему желанию.</string>
+-    <string name="preference_category_gyro_controls">Гироскоп</string>
+     <string name="preference_category_virtual_mouse">Виртуальная мышь</string>
+-    <string name="preference_gyro_invert_x_axis">Инвертировать поворот</string>
+-    <string name="preference_gyro_invert_y_axis">Инвертировать наклон</string>
+-    <string name="preference_gyro_invert_x_axis_description">Поменять направление поворота по горизонтали.</string>
+-    <string name="preference_gyro_invert_y_axis_description">Поменять направление наклона по вертикали.</string>
+-    <string name="preference_gyro_smoothing_title">Сглаживание движения</string>
+-    <string name="preference_gyro_smoothing_description">Значительно повышает плавность движения камеры за счёт небольшой задержки ввода.</string>
+     <string name="preference_back_title">Назад</string>
+     <string name="unnamed">Безымянный</string>
+     <string name="profiles_latest_snapshot">Последний снапшот</string>
+@@ -214,13 +207,6 @@
+     <string name="xerr_child">Для входа в игру учётная запись ребёнка должна быть добавлена в семью.</string>
+     <string name="mc_not_owned">Похоже что данный аккаунт не имеет профиля MC. Если у вас активен Xbox Game Pass, пожалуйста перейдите на сайт игры и настройте ваш профиль</string>
+     <string name="xerr_not_available">Xbox Live недоступен в вашей стране</string>
+-    <string name="preference_enable_gyro_title">Управление наклоном</string>
+-    <string name="preference_enable_gyro_description">Позволяет управлять положением камеры в игре путём вращения устройства.</string>
+-    <string name="preference_gyro_sensitivity_title">Чувствительность гироскопа</string>
+-    <string name="preference_gyro_sensitivity_description">Изменение чувствительности датчика вращения.</string>
+-    <string name="toast_turn_on_gyro">Сначала включите «Управление наклоном».</string>
+-    <string name="preference_gyro_sample_rate_title">Интервал опроса гироскопа</string>
+-    <string name="preference_gyro_sample_rate_description">Увеличьте, если управление наклоном снижает производительность.</string>
+     <string name="microsoft_login_retry_later">Слишком много запросов, попробуйте ещё раз позже.</string>
+     <string name="storage_required">MJLauncher требует подключения к внешнему хранилищу. Переподключите его и перезапустите приложение.</string>
+     <string name="mcl_setting_title_buttonallcaps">Заглавные буквы на кнопках</string>
+@@ -448,7 +434,6 @@
+     <string name="preference_show_memory_warning_title">Показывать предупреждение о недостатке памяти</string>
+     <string name="loading_screen_title">Ожидание появления окна игры…</string>
+     <string name="loading_screen_booted">Запущено - используется %1$s!</string>
+-    <string name="loading_screen_warning">Если окно долго не появляется - возможно игра вылетела</string>
+     <string name="preference_metadata_clear">Очистить кэш метаданных</string>
+     <string name="preference_metadata_clear_summary">Полностью удаляет кэш метаданных строк. Используйте, если лаунчер не видит новые версии игры или загрузчиков модов</string>
+     <string name="preference_metadata_clear_fail">Не удалось удалить файлы кэша</string>
+diff --git a/app_mojo/src/main/res/values-sk-rSK/strings.xml b/app_mojo/src/main/res/values-sk-rSK/strings.xml
+index c75870f8d0b14d9f4197f950988664ac19be2240..157b7aea77e58a1361f2bc61c5775871c01f6745 100644
+--- a/app_mojo/src/main/res/values-sk-rSK/strings.xml
++++ b/app_mojo/src/main/res/values-sk-rSK/strings.xml
+@@ -179,13 +179,6 @@
+     <string name="preference_force_english_description">Umožňuje vidieť pôvodné názvy tlačidiel navrhnuté vývojármi. Na nastavenie je nutný reštart aplikácie.</string>
+     <string name="preference_edit_controls_title">Vlastné ovládacie prvky</string>
+     <string name="preference_edit_controls_summary">Prispôsobte si kontrolky podľa svojich predstáv.</string>
+-    <string name="preference_category_gyro_controls">Ovládanie gyroskopom</string>
+-    <string name="preference_gyro_invert_x_axis">Invertovať os X</string>
+-    <string name="preference_gyro_invert_y_axis">Invertovať os Y</string>
+-    <string name="preference_gyro_invert_x_axis_description">Invertovať vodorovnú os.</string>
+-    <string name="preference_gyro_invert_y_axis_description">Invertovať výškovú os.</string>
+-    <string name="preference_gyro_smoothing_title">Vyhladzovanie pohybu gyroskopu</string>
+-    <string name="preference_gyro_smoothing_description">Stabilizuje pohyby gyroskopom ale oneskoruje ich.</string>
+     <string name="preference_back_title">Späť na poslednú stránku</string>
+     <string name="unnamed">Nepomenované</string>
+     <string name="profiles_latest_snapshot">Najnovší snapshot</string>
+@@ -217,13 +210,6 @@
+     <string name="xerr_child">Vaše konto je detské konto a na prihlásenie je potrebné pridať ho do rodiny v rámci Microsoftu.</string>
+ 
+     <string name="xerr_not_available">Služba Xbox Live nie je dostupná vo vašej krajine</string>
+-    <string name="preference_enable_gyro_title">Ovládanie gyroskopom</string>
+-    <string name="preference_enable_gyro_description">Povolením tohto sa budete môcť otáčať v hre otáčaním mobilu.</string>
+-    <string name="preference_gyro_sensitivity_title">Citlivosť gyroskopu</string>
+-    <string name="preference_gyro_sensitivity_description">Upravte si citlivosť gyroskopu na otáčanie.</string>
+-    <string name="toast_turn_on_gyro">Zapnite ovládanie gyroskopom pred použitím tohto nastavenia!</string>
+-    <string name="preference_gyro_sample_rate_title">Obnovovacia frekvencia gyroskopu</string>
+-    <string name="preference_gyro_sample_rate_description">Ak máte problémy s výkonom pri používaní ovládania gyroskopom, zvýšte toto.</string>
+     <string name="microsoft_login_retry_later">Príliš veľa žiadostí. Skúste to neskôr, prosím.</string>
+     <string name="storage_required">MJLauncher vyžaduje pripojené externé úložisko. Pripojte ho a reštartujte aplikáciu.</string>
+     <string name="mcl_setting_title_buttonallcaps">V označeniach tlačidiel používať len veľké písmená</string>
+diff --git a/app_mojo/src/main/res/values-th/strings.xml b/app_mojo/src/main/res/values-th/strings.xml
+index 29161c4aa3938bf0c639035b7beb564e65c2aaae..af96326bf0822a7b6eda4ee26c3e15ab2b90a674 100644
+--- a/app_mojo/src/main/res/values-th/strings.xml
++++ b/app_mojo/src/main/res/values-th/strings.xml
+@@ -180,13 +180,6 @@
+     <string name="preference_force_english_description">ช่วยให้คุณเห็นสตริงต้นฉบับตามที่นักพัฒนาต้องการ จำเป็นต้องรีสตาร์ท</string>
+     <string name="preference_edit_controls_title">เเก้ไขการควบคุมกำหนดเอง</string>
+     <string name="preference_edit_controls_summary">ปรับแต่งรูปแบบการควบคุมให้เหมาะกับความต้องการของคุณ</string>
+-    <string name="preference_category_gyro_controls">การควบคุมไจโรสโคป</string>
+-    <string name="preference_gyro_invert_x_axis">กลับแกน x</string>
+-    <string name="preference_gyro_invert_y_axis">กลับแกน Y</string>
+-    <string name="preference_gyro_invert_x_axis_description">กลับแกนนอน</string>
+-    <string name="preference_gyro_invert_y_axis_description">กลับแกนแนวตั้ง</string>
+-    <string name="preference_gyro_smoothing_title">เปิดใช้งานการปรับไจโรสโคปให้เรียบ</string>
+-    <string name="preference_gyro_smoothing_description">ลดความกระวนกระวายใจในการแลกเปลี่ยนเวลาแฝง</string>
+     <string name="preference_back_title">กลับไปหน้าที่เเล้ว</string>
+     <string name="unnamed">ไม่มีชื่อ</string>
+     <string name="profiles_latest_snapshot">ตัวทดลองล่าสุด</string>
+@@ -220,13 +213,6 @@
+     <string name="xerr_child">บัญชีของคุณคือบัญชีเด็ก, เเล้วต้องเพื่มลงระบบครอบครัวเพื่อล็อกอิน</string>
+ 
+     <string name="xerr_not_available">เอ็กบอดไลฟ์ ไม่มีที่อยู่ของคุณ</string>
+-    <string name="preference_enable_gyro_title">เปิดใช้งานการควบคุมไจโรสโคป</string>
+-    <string name="preference_enable_gyro_description">การเปิดใช้งานนี้จะช่วยให้คุณสามารถเปิดเกมได้โดยการหมุนโทรศัพท์ของคุณ</string>
+-    <string name="preference_gyro_sensitivity_title">ความรวดเร็วในการควบคุมไจโร</string>
+-    <string name="preference_gyro_sensitivity_description">ปรับความไวของตัวควบคุมไจโรสโคป</string>
+-    <string name="toast_turn_on_gyro">เปิดใช้งานการควบคุมไจโรสโคปก่อนเพื่อใช้สิ่งนี้!</string>
+-    <string name="preference_gyro_sample_rate_title">อัตราการสุ่มตัวอย่างไจโร</string>
+-    <string name="preference_gyro_sample_rate_description">หากคุณมีปัญหาด้านประสิทธิภาพกับการควบคุมไจโรสโคป ให้เพิ่มสิ่งนี้</string>
+     <string name="microsoft_login_retry_later">ส่งคำขอบ่อยเกินไป, กรุณาลองอีกครั้งภายหลัง</string>
+     <string name="storage_required">MJLauncher จำเป็นต้องแนบที่จัดเก็บข้อมูลภายนอก โปรดเชื่อมต่อใหม่และรีสตาร์ทแอป</string>
+     <string name="mcl_setting_title_buttonallcaps">ใช้อักษรตัวพิมพ์ใหญ่ในป้ายปุ่มเท่านั้น</string>
+diff --git a/app_mojo/src/main/res/values-tr/strings.xml b/app_mojo/src/main/res/values-tr/strings.xml
+index 65395d21cbee37731fd3f5e10912c3b058f4774e..39d5bbb2b9e9fc3dc16139927709288c99be5d12 100644
+--- a/app_mojo/src/main/res/values-tr/strings.xml
++++ b/app_mojo/src/main/res/values-tr/strings.xml
+@@ -180,14 +180,7 @@
+     <string name="preference_force_english_description">Geliştiriciler tarafından amaçlanan orijinal yazıları görmenizi sağlar. Yeniden başlatma gerektirir.</string>
+     <string name="preference_edit_controls_title">Özel kontrolleri düzenle</string>
+     <string name="preference_edit_controls_summary">İhtiyaçlarınıza göre kontrol şemasını ayarlayın.</string>
+-    <string name="preference_category_gyro_controls">Jiroskop kontrolleri</string>
+     <string name="preference_category_virtual_mouse">Sanal Fare</string>
+-    <string name="preference_gyro_invert_x_axis">X eksenini ters çevir</string>
+-    <string name="preference_gyro_invert_y_axis">Y eksenini tersine çevir</string>
+-    <string name="preference_gyro_invert_x_axis_description">Yatay ekseni ters çevir.</string>
+-    <string name="preference_gyro_invert_y_axis_description">Dikey ekseni ters çevir.</string>
+-    <string name="preference_gyro_smoothing_title">Jiroskopik yumuşatmayı etkinleştir</string>
+-    <string name="preference_gyro_smoothing_description">Gecikme karşılığında titremeyi azaltın.</string>
+     <string name="preference_back_title">Son ekrana geri dön</string>
+     <string name="unnamed">Adsız</string>
+     <string name="profiles_latest_snapshot">En son test sürümü</string>
+@@ -220,13 +213,6 @@
+     <string name="xerr_child">Hesabınız bir çocuk hesabı ve giriş yapabilmek için bir aileye eklenmesi gerekiyor.</string>
+ 
+     <string name="xerr_not_available">Xbox Live ülkenizde mevcut değil</string>
+-    <string name="preference_enable_gyro_title">Jiroskop kontrollerini etkinleştir</string>
+-    <string name="preference_enable_gyro_description">Bunu etkinleştirmek, telefonunuzu çevirerek oyun içi dönüş yapmanızı sağlayacaktır.</string>
+-    <string name="preference_gyro_sensitivity_title">Jiroskop kontrolleri hassaslığı</string>
+-    <string name="preference_gyro_sensitivity_description">Jiroskop kontrollerinin hassaslığını ayarlayın.</string>
+-    <string name="toast_turn_on_gyro">Bunu kullanabilmek için ilk olarak Jiroskop ayarlarını etkinleştirin!</string>
+-    <string name="preference_gyro_sample_rate_title">Jiroskop örnekleme oranı</string>
+-    <string name="preference_gyro_sample_rate_description">Eğer jiroskop kontrolleriyle performans probleminiz varsa bunu arttırın.</string>
+     <string name="microsoft_login_retry_later">Çok fazla istek, Lütfen daha sonra tekrar deneyin.</string>
+     <string name="storage_required">MJLauncher harici depolama biriminin bağlı olmasını gerektirir. Lütfen yeniden bağlayın ve uygulamayı yeniden başlatın.</string>
+     <string name="mcl_setting_title_buttonallcaps">Düğme etiketlerinde yalnızca büyük harfler kullanın</string>
+diff --git a/app_mojo/src/main/res/values-uk/strings.xml b/app_mojo/src/main/res/values-uk/strings.xml
+index 65e200fb64da7a4afb80efd3cb1cb27287e0ce68..4558a664af1439af646da9bdeff769f050aeb9ea 100644
+--- a/app_mojo/src/main/res/values-uk/strings.xml
++++ b/app_mojo/src/main/res/values-uk/strings.xml
+@@ -182,14 +182,7 @@
+     <string name="preference_force_english_description">Змінює поточну мову на англійську, дозволяючи побачити рядки задумані розробниками. Потребує перезапуску.</string>
+     <string name="preference_edit_controls_title">Редагувати елементи керування</string>
+     <string name="preference_edit_controls_summary">Налаштувати схему керування так як вам потрібно.</string>
+-    <string name="preference_category_gyro_controls">Керування гіроскопом</string>
+     <string name="preference_category_virtual_mouse">Віртуальна миша</string>
+-    <string name="preference_gyro_invert_x_axis">Обернути вісь X</string>
+-    <string name="preference_gyro_invert_y_axis">Обернути вісь Y</string>
+-    <string name="preference_gyro_invert_x_axis_description">Інвертувати вісь X.</string>
+-    <string name="preference_gyro_invert_y_axis_description">Інвертувати вісь Y.</string>
+-    <string name="preference_gyro_smoothing_title">Увімкнути згладжування гіроскопа</string>
+-    <string name="preference_gyro_smoothing_description">Збільшити плавність руху камери в обмін на затримку вводу.</string>
+     <string name="preference_back_title">Назад</string>
+     <string name="unnamed">Безіменний</string>
+     <string name="profiles_latest_snapshot">Останній снапшот</string>
+@@ -222,13 +215,6 @@
+     <string name="xerr_child">Ваш обліковий запис є обліковим записом для дитини, і для входу в нього потрібно додати його до сім’ї.</string>
+ 
+     <string name="xerr_not_available">Xbox Live недоступний у вашому регіоні</string>
+-    <string name="preference_enable_gyro_title">Увімкнути гіроскоп</string>
+-    <string name="preference_enable_gyro_description">Увімкнувши цю функцію, ви зможете повертатися в грі, просто повернувши телефон.</string>
+-    <string name="preference_gyro_sensitivity_title">Чутливість гіроскопа</string>
+-    <string name="preference_gyro_sensitivity_description">Відрегулювати чутливість гіроскопа.</string>
+-    <string name="toast_turn_on_gyro">Спочатку увімкніть гіроскоп, щоб скористатися цією функцією!</string>
+-    <string name="preference_gyro_sample_rate_title">Частота оновлення гіроскопа</string>
+-    <string name="preference_gyro_sample_rate_description">Якщо у вас виникають проблеми з гіроскопом, збільште цей параметр.</string>
+     <string name="microsoft_login_retry_later">Занадто багато запитів, спробуйте пізніше.</string>
+     <string name="storage_required">MJLauncher потрібен дозвіл для доступу в сховище, дайте цей доступ та перезапустіть лаунчер</string>
+     <string name="mcl_setting_title_buttonallcaps">Використовувати лише великі літери в назвах кнопок</string>
+diff --git a/app_mojo/src/main/res/values-vi/strings.xml b/app_mojo/src/main/res/values-vi/strings.xml
+index a2228310b22f249239b94d69dd46a2775904be48..86c15b388f4cdf0b7e9d064fac629786f2474a14 100644
+--- a/app_mojo/src/main/res/values-vi/strings.xml
++++ b/app_mojo/src/main/res/values-vi/strings.xml
+@@ -207,14 +207,7 @@
+     <string name="preference_force_english_description">Cho phép hiển thị các dòng chữ ban đầu, như theo ý định của nhà phát triển. Yêu cầu khởi động lại.</string>
+     <string name="preference_edit_controls_title">Tùy chỉnh điều khiển</string>
+     <string name="preference_edit_controls_summary">Điều chỉnh sơ đồ điều khiển để phù hợp với nhu cầu của bạn</string>
+-    <string name="preference_category_gyro_controls">Điều khiển con quay hồi chuyển</string>
+     <string name="preference_category_virtual_mouse">Chuột ảo</string>
+-    <string name="preference_gyro_invert_x_axis">Đảo ngược trục X</string>
+-    <string name="preference_gyro_invert_y_axis">Đảo ngược trục Y</string>
+-    <string name="preference_gyro_invert_x_axis_description">Đảo ngược trục hoành.</string>
+-    <string name="preference_gyro_invert_y_axis_description">Đảo ngược trục tung.</string>
+-    <string name="preference_gyro_smoothing_title">Bật làm mịn con quay hồi chuyển</string>
+-    <string name="preference_gyro_smoothing_description">Reduce jitter in exchange of latency.</string>
+ 
+     <string name="preference_back_title">Quay về màn hình trước đó</string>
+     <string name="unnamed">Chưa đặt tên</string>
+@@ -253,13 +246,6 @@
+     <string name="xerr_child">Tài khoản của bạn là tài khoản trẻ em, và phải được thêm vào một Gia đình để có thể đăng nhập.</string>
+ 
+     <string name="xerr_not_available">Xbox Live không có sẵn ở quốc gia của bạn</string>
+-    <string name="preference_enable_gyro_title">Bật con quay hồi chuyển</string>
+-    <string name="preference_enable_gyro_description">Bật cái này sẽ cho phép bạn quay trong trò chơi bằng cách quay điện thoại của bạn.</string>
+-    <string name="preference_gyro_sensitivity_title">Độ nhạy con quay hồi chuyển</string>
+-    <string name="preference_gyro_sensitivity_description">Điều chỉnh độ nhạy khi điều khiển con quay hồi chuyển.</string>
+-    <string name="toast_turn_on_gyro">Bật chế độ con quay hồi chuyển trước khi sử dụng tính năng này!</string>
+-    <string name="preference_gyro_sample_rate_title">Tốc độ lấy mẫu con quay hồi chuyển</string>
+-    <string name="preference_gyro_sample_rate_description">..</string>
+     <string name="microsoft_login_retry_later">Có quá nhiều yêu cầu, vui lòng thử lại sau.</string>
+     <string name="storage_required">MJLauncher cần kho dữ liệu bên ngoài để gắn vào. Vui lòng kết nối lại và khởi động lại ứng dụng.</string>
+     <string name="mcl_setting_title_buttonallcaps">Chỉ được dùng những chữ cái in hoa trong các nhãn nút</string>
+diff --git a/app_mojo/src/main/res/values-zh-rCN/strings.xml b/app_mojo/src/main/res/values-zh-rCN/strings.xml
+index 6345d10497b37738c447e9b738a5032fd22d30e6..c2c4369db33be4b49e20c4e7c5afa5c41f4fa333 100644
+--- a/app_mojo/src/main/res/values-zh-rCN/strings.xml
++++ b/app_mojo/src/main/res/values-zh-rCN/strings.xml
+@@ -183,14 +183,7 @@
+     <string name="preference_force_english_description">允许您按开发者的原意看到原始字符串，此操作需要重启。</string>
+     <string name="preference_edit_controls_title">编辑控制布局</string>
+     <string name="preference_edit_controls_summary">调整控制布局方案以适应您的需求。</string>
+-    <string name="preference_category_gyro_controls">陀螺仪控制</string>
+     <string name="preference_category_virtual_mouse">虚拟鼠标</string>
+-    <string name="preference_gyro_invert_x_axis">反转 X 轴</string>
+-    <string name="preference_gyro_invert_y_axis">反转 Y 轴</string>
+-    <string name="preference_gyro_invert_x_axis_description">反转水平轴</string>
+-    <string name="preference_gyro_invert_y_axis_description">反转垂直轴</string>
+-    <string name="preference_gyro_smoothing_title">启用陀螺仪平滑</string>
+-    <string name="preference_gyro_smoothing_description">减少抖动以换取延迟。</string>
+     <string name="preference_back_title">返回上一页</string>
+     <string name="unnamed">未命名</string>
+     <string name="profiles_latest_snapshot">最新快照版</string>
+@@ -223,13 +216,6 @@
+     <string name="xerr_child">您的账户是儿童账户，需要添加到家庭中方能登录。</string>
+ 
+     <string name="xerr_not_available">Xbox Live 在您所在的国家/地区不可用。</string>
+-    <string name="preference_enable_gyro_title">启用陀螺仪控制</string>
+-    <string name="preference_enable_gyro_description">启用此功能将允许您通过转动手机来在游戏中转动视角。</string>
+-    <string name="preference_gyro_sensitivity_title">陀螺仪控制灵敏度</string>
+-    <string name="preference_gyro_sensitivity_description">调整陀螺仪控制的灵敏度。</string>
+-    <string name="toast_turn_on_gyro">需要先启用陀螺仪控制才能使用！</string>
+-    <string name="preference_gyro_sample_rate_title">陀螺仪采样率</string>
+-    <string name="preference_gyro_sample_rate_description">如果您在陀螺仪控制上遇到性能问题，请增加此值。</string>
+     <string name="microsoft_login_retry_later">您的操作过于频繁，请稍后重试。</string>
+     <string name="storage_required">MJLauncher 需要连接外部存储，请重新连接并重启应用。</string>
+     <string name="mcl_setting_title_buttonallcaps">在按钮标签中仅使用大写字母</string>
+diff --git a/app_mojo/src/main/res/values-zh-rTW/strings.xml b/app_mojo/src/main/res/values-zh-rTW/strings.xml
+index 80e07891a61fc57da78c5de8ba14766be89b9d57..b9ec3141bfe94f7c9f3361034369313484b44325 100644
+--- a/app_mojo/src/main/res/values-zh-rTW/strings.xml
++++ b/app_mojo/src/main/res/values-zh-rTW/strings.xml
+@@ -183,14 +183,7 @@
+     <string name="preference_force_english_description">允許你查看開發人員預期的原始字串。需要重新啟動。</string>
+     <string name="preference_edit_controls_title">自訂控制鍵</string>
+     <string name="preference_edit_controls_summary">調整控制配置以符合你的需求。</string>
+-    <string name="preference_category_gyro_controls">陀螺儀控制</string>
+     <string name="preference_category_virtual_mouse">虛擬滑鼠</string>
+-    <string name="preference_gyro_invert_x_axis">反轉 X 軸</string>
+-    <string name="preference_gyro_invert_y_axis">反轉 Y 軸</string>
+-    <string name="preference_gyro_invert_x_axis_description">反轉水平軸</string>
+-    <string name="preference_gyro_invert_y_axis_description">反轉垂直軸</string>
+-    <string name="preference_gyro_smoothing_title">啟用陀螺儀平滑</string>
+-    <string name="preference_gyro_smoothing_description">減少抖動以換取延遲</string>
+     <string name="preference_back_title">返回上一個畫面</string>
+     <string name="unnamed">未命名</string>
+     <string name="profiles_latest_snapshot">最新快照</string>
+@@ -223,13 +216,6 @@
+     <string name="xerr_child">因為你的 Xbox 帳號未成年，若要登入，請將此帳號加入 Microsoft 家庭</string>
+ 
+     <string name="xerr_not_available">Xbox Live 在你的國家/地區無法使用</string>
+-    <string name="preference_enable_gyro_title">啟用陀螺儀控制</string>
+-    <string name="preference_enable_gyro_description">啟用此功能將允許你透過轉動手機來在遊戲中轉動視角。</string>
+-    <string name="preference_gyro_sensitivity_title">陀螺儀控制靈敏度</string>
+-    <string name="preference_gyro_sensitivity_description">調整陀螺儀控制的靈敏度</string>
+-    <string name="toast_turn_on_gyro">需要先啟用陀螺儀控制才能使用</string>
+-    <string name="preference_gyro_sample_rate_title">陀螺儀取樣率</string>
+-    <string name="preference_gyro_sample_rate_description">如果你在陀螺儀控制上遇到效能問題，請增加此值。</string>
+     <string name="microsoft_login_retry_later">你的操作過於頻繁，請稍後再試！</string>
+     <string name="storage_required">MJLauncher 需要連接外部儲存空間，請重新連接並重新啟動應用程式。</string>
+     <string name="mcl_setting_title_buttonallcaps">在按鈕標籤中僅使用大寫字母</string>
+diff --git a/app_mojo/src/main/res/values/strings.xml b/app_mojo/src/main/res/values/strings.xml
+index 46b27f60578fb31485900d27c757e827eca4a960..392e1d1310576dbc126c6e792f3086c978b112ac 100644
+--- a/app_mojo/src/main/res/values/strings.xml
++++ b/app_mojo/src/main/res/values/strings.xml
+@@ -220,15 +220,8 @@
+     <string name="preference_edit_controls_title">Edit custom controls</string>
+     <string name="preference_edit_controls_summary">Tweak the control scheme to fit your needs.</string>
+ 
+-    <string name="preference_category_gyro_controls">Gyroscope controls</string>
+     <string name="preference_category_virtual_mouse">Virtual mouse</string>
+ 
+-    <string name="preference_gyro_invert_x_axis">Invert X axis</string>
+-    <string name="preference_gyro_invert_y_axis">Invert Y axis</string>
+-    <string name="preference_gyro_invert_x_axis_description">Invert the horizontal axis.</string>
+-    <string name="preference_gyro_invert_y_axis_description">Invert the vertical axis.</string>
+-    <string name="preference_gyro_smoothing_title">Enable gyroscope smoothing</string>
+-    <string name="preference_gyro_smoothing_description">Reduce jitter in exchange of latency.</string>
+ 
+     <string name="preference_back_title">Back to the last screen</string>
+     <string name="unnamed">Unnamed</string>
+@@ -267,13 +260,6 @@
+     <string name="xerr_child">Your account is a child account, and needs to be added into a Family in order to log in.</string>
+     <string name="mc_not_owned">It seems like this account does not have an MC profile. If you have Xbox Game Pass, please log in to the game\'s website and set up your profile.</string>
+     <string name="xerr_not_available">Xbox Live is not available in your country</string>
+-    <string name="preference_enable_gyro_title">Enable gyroscope controls</string>
+-    <string name="preference_enable_gyro_description">Enabling this will allow you to turn in-game by turning your phone.</string>
+-    <string name="preference_gyro_sensitivity_title">Gyroscope controls sensitivity</string>
+-    <string name="preference_gyro_sensitivity_description">Adjust the sensitivity of gyroscope controls.</string>
+-    <string name="toast_turn_on_gyro">Enable gyroscope controls first to use this!</string>
+-    <string name="preference_gyro_sample_rate_title">Gyroscope sampling rate</string>
+-    <string name="preference_gyro_sample_rate_description">If you have performance issues with gyroscope controls, increase this.</string>
+     <string name="microsoft_login_retry_later">Too many requests, please try again later.</string>
+     <string name="microsoft_login_generic">Error: %s</string>
+     <string name="storage_required">MJLauncher requires external storage to be attached. Please reconnect it and restart the app.</string>
+@@ -513,7 +499,6 @@
+     <string name="option_do_not_show_again">Don\'t show again</string>
+     <string name="loading_screen_title">Waiting for a game window to appear…</string>
+     <string name="loading_screen_booted">Ready - running on %1$s!</string>
+-    <string name="loading_screen_warning">If you are stuck here, the game might have crashed</string>
+     <string name="preference_metadata_clear">Clear metadata cache</string>
+     <string name="preference_metadata_clear_summary">Removes all strings metadata cache and forces a rebuild. Use this if the launcher can\'t see new game or modloader versions</string>
+     <string name="preference_metadata_clear_fail">Failed to remove cache files</string>
+diff --git a/app_mojo/src/main/res/values/values.xml b/app_mojo/src/main/res/values/values.xml
+index 3220345b68f371fb57f3cd9e17e0a40ca8407516..ca7522681795d9408428fa3f463a7586d3441a72 100644
+--- a/app_mojo/src/main/res/values/values.xml
++++ b/app_mojo/src/main/res/values/values.xml
+@@ -20,12 +20,7 @@
+     <integer name="mouse_speed_seekbar_min">25</integer>
+     <integer name="mouse_speed_seekbar_max">300</integer>
+ 
+-    <integer name="gyro_speed_seekbar_increment">5</integer>
+-    <integer name="gyro_speed_seekbar_min">25</integer>
+-    <integer name="gyro_speed_seekbar_max">300</integer>
+ 
+-    <integer name="gyro_rate_seekbar_min">5</integer>
+-    <integer name="gyro_rate_seekbar_max">50</integer>
+ 
+     <integer name="gamepad_deadzone_seekbar_increment">5</integer>
+     <integer name="gamepad_deadzone_seekbar_min">50</integer>
+diff --git a/app_mojo/src/main/res/xml/pref_control.xml b/app_mojo/src/main/res/xml/pref_control.xml
+index e489a4c6a2d2ed482ed9a80d58ac2169721dca3d..54587871707a8a81b45022398384ff5eaa525c5a 100644
+--- a/app_mojo/src/main/res/xml/pref_control.xml
++++ b/app_mojo/src/main/res/xml/pref_control.xml
+@@ -110,49 +110,7 @@
+             android:icon="@drawable/ic_px_virtual_mouse"/>
+     </PreferenceCategory>
+ 
+-    <PreferenceCategory
+-        android:key="gyroCategory"
+-        android:title="@string/preference_category_gyro_controls"
+-        >
+-        <SwitchPreferenceCompat
+-            android:key="enableGyro"
+-            android:title="@string/preference_enable_gyro_title"
+-            android:summary="@string/preference_enable_gyro_description"/>
+-        <git.artdeell.mojo.prefs.CustomSeekBarPreference
+-            android:key="gyroSensitivity"
+-            android:title="@string/preference_gyro_sensitivity_title"
+-            android:summary="@string/preference_gyro_sensitivity_description"
+-            app2:selectable="false"
+-            app2:min="@integer/gyro_speed_seekbar_min"
+-            android:max="@integer/gyro_speed_seekbar_max"
+-            app2:seekBarIncrement="@integer/gyro_speed_seekbar_increment"
+-            app2:showSeekBarValue="true"/>
+-        <git.artdeell.mojo.prefs.CustomSeekBarPreference
+-            android:key="gyroSampleRate"
+-            android:title="@string/preference_gyro_sample_rate_title"
+-            android:summary="@string/preference_gyro_sample_rate_description"
+-            app2:min="@integer/gyro_rate_seekbar_min"
+-            android:max="@integer/gyro_rate_seekbar_max"
+-            app2:selectable="false"
+-            app2:showSeekBarValue="true"/>
+-        <SwitchPreferenceCompat
+-            android:key="gyroSmoothing"
+-            android:title="@string/preference_gyro_smoothing_title"
+-            android:summary="@string/preference_gyro_smoothing_description"
+-            android:defaultValue="true"
+-            />
+-        <SwitchPreferenceCompat
+-            android:key="gyroInvertX"
+-            android:title="@string/preference_gyro_invert_x_axis"
+-            android:summary="@string/preference_gyro_invert_x_axis_description"/>
+-        <SwitchPreferenceCompat
+-            android:key="gyroInvertY"
+-            android:title="@string/preference_gyro_invert_y_axis"
+-            android:summary="@string/preference_gyro_invert_y_axis_description"/>
+-
+-    </PreferenceCategory>
+-
+-    <PreferenceCategory
++<PreferenceCategory
+         android:title="@string/preference_category_controller_settings"
+         >
+         <Preference
