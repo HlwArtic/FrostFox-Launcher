@@ -1,0 +1,468 @@
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/LauncherActivity.java b/app_mojo/src/main/java/git/artdeell/mojo/LauncherActivity.java
+index 3711da8fb5e0ada813f56b55b8803a6d86c2b21c..da3e98fb06dd5627668b6cadbf1490608c06a18b 100644
+--- a/app_mojo/src/main/java/git/artdeell/mojo/LauncherActivity.java
++++ b/app_mojo/src/main/java/git/artdeell/mojo/LauncherActivity.java
+@@ -29,6 +29,7 @@ import git.artdeell.mojo.authenticator.accounts.Accounts;
+ import git.artdeell.mojo.extra.ExtraConstants;
+ import git.artdeell.mojo.extra.ExtraCore;
+ import git.artdeell.mojo.extra.ExtraListener;
++import git.artdeell.mojo.fragments.LogsFragment;
+ import git.artdeell.mojo.fragments.MainMenuFragment;
+ import git.artdeell.mojo.fragments.MicrosoftLoginFragment;
+ import git.artdeell.mojo.fragments.SelectAuthFragment;
+@@ -196,6 +197,16 @@ public class LauncherActivity extends BaseActivity {
+         if(LauncherPreferences.PREF_MIGRATION_NOTICE)
+             MojoApplication.sExecutorService.submit(this::checkPreviousInstalls);
+ 
++        // FrostFox: "sustained performance" limits the phone's top speed to stay cool, which lowers FPS.
++        // It is now off by default, and turned off once for existing installs. It can still be switched on in Settings.
++        if(!LauncherPreferences.DEFAULT_PREF.getBoolean("frostSustainedReset", false)) {
++            LauncherPreferences.DEFAULT_PREF.edit()
++                    .putBoolean("sustainedPerformance", false)
++                    .putBoolean("frostSustainedReset", true)
++                    .apply();
++            LauncherPreferences.PREF_SUSTAINED_PERFORMANCE = false;
++        }
++
+         mNotificationManager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+         ProgressKeeper.addTaskCountListener(mDoubleLaunchPreventionListener);
+         ProgressKeeper.addTaskCountListener((mProgressServiceKeeper = new ProgressServiceKeeper(this)));
+@@ -340,6 +351,8 @@ public class LauncherActivity extends BaseActivity {
+     private void bindViews(){
+         mFragmentView = findViewById(R.id.container_fragment);
+         mSettingsButton = findViewById(R.id.setting_button);
++        // FrostFox: Logs sits in the top bar next to Settings
++        findViewById(R.id.logs_button).setOnClickListener(v -> Tools.swapFragment(this, LogsFragment.class, LogsFragment.TAG, null));
+         mProgressLayout = findViewById(R.id.progress_layout);
+     }
+ }
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/fragments/MainMenuFragment.java b/app_mojo/src/main/java/git/artdeell/mojo/fragments/MainMenuFragment.java
+index d55166cbcc6ba9b50c7511c3b857b94c1f924696..9d1585516a2302957faa495f3f1d5a187690a2af 100644
+--- a/app_mojo/src/main/java/git/artdeell/mojo/fragments/MainMenuFragment.java
++++ b/app_mojo/src/main/java/git/artdeell/mojo/fragments/MainMenuFragment.java
+@@ -51,7 +51,6 @@ public class MainMenuFragment extends Fragment {
+     public void onViewCreated(@NonNull View view, @Nullable Bundle savedInstanceState) {
+         View mCustomControlButton = view.findViewById(R.id.custom_control_button);
+         View mInstallJarButton = view.findViewById(R.id.install_jar_button);
+-        View mShareLogsButton = view.findViewById(R.id.share_logs_button);
+         View mOpenDirectoryButton = view.findViewById(R.id.open_files_button);
+         View mResourcePacksButton = view.findViewById(R.id.resource_packs_button);
+ 
+@@ -66,7 +65,13 @@ public class MainMenuFragment extends Fragment {
+                             android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                             android.view.ViewGroup.LayoutParams.MATCH_PARENT));
+         }
+-        mCustomControlButton.setOnClickListener(v -> startActivity(new Intent(requireContext(), CustomControlsActivity.class)));
++        // FrostFox: the Controls card lets you pick the default control map from your files.
++        // Press and hold it to open the layout editor.
++        mCustomControlButton.setOnClickListener(v -> pickDefaultControls());
++        mCustomControlButton.setOnLongClickListener(v -> {
++            startActivity(new Intent(requireContext(), CustomControlsActivity.class));
++            return true;
++        });
+         // FrostFox: the Mods card opens the Mods screen
+         mInstallJarButton.setOnClickListener(v -> Tools.swapFragment(requireActivity(), ModsFragment.class, ModsFragment.TAG, null));
+         mResourcePacksButton.setOnClickListener(v -> Tools.swapFragment(requireActivity(), ResourcePacksFragment.class, ResourcePacksFragment.TAG, null));
+@@ -77,8 +82,6 @@ public class MainMenuFragment extends Fragment {
+         FrostSetup.sListener = () -> Tools.runOnUiThread(this::updateDownloadLabel);
+         updateDownloadLabel();
+ 
+-        // FrostFox: the Logs card opens the log viewer and crash reports
+-        mShareLogsButton.setOnClickListener(v -> Tools.swapFragment(requireActivity(), LogsFragment.class, LogsFragment.TAG, null));
+ 
+         mOpenDirectoryButton.setOnClickListener((v)-> openGameDirectory(v.getContext()));
+ 
+@@ -104,6 +107,11 @@ public class MainMenuFragment extends Fragment {
+         super.onResume();
+         ExtraCore.setValue(ExtraConstants.REFRESH_ACCOUNT_SPINNER, true);
+         updateDownloadLabel();
++        if(mAwaitingControlPick) {
++            mAwaitingControlPick = false;
++            Object picked = ExtraCore.consumeValue(ExtraConstants.FILE_SELECTOR);
++            if(picked instanceof String) applyDefaultControls((String) picked);
++        }
+     }
+ 
+     private void runInstallerWithConfirmation() {
+@@ -131,4 +139,29 @@ public class MainMenuFragment extends Fragment {
+         mPlayButton = null;
+         super.onDestroyView();
+     }
++
++    private boolean mAwaitingControlPick;
++
++    private void pickDefaultControls() {
++        mAwaitingControlPick = true;
++        Bundle bundle = new Bundle(2);
++        bundle.putBoolean(FileSelectorFragment.BUNDLE_SELECT_FOLDER, false);
++        bundle.putString(FileSelectorFragment.BUNDLE_ROOT_PATH, Tools.CTRLMAP_PATH);
++        Tools.swapFragment(requireActivity(), FileSelectorFragment.class, FileSelectorFragment.TAG, bundle);
++    }
++
++    private void applyDefaultControls(String selected) {
++        File file = selected.startsWith("/") ? new File(selected)
++                : new File(Tools.CTRLMAP_PATH, selected.startsWith("./") ? selected.substring(2) : selected);
++        if(!file.isFile()) {
++            Toast.makeText(requireContext(), "Could not find that controls file", Toast.LENGTH_LONG).show();
++            return;
++        }
++        String path = file.getAbsolutePath();
++        git.artdeell.mojo.prefs.LauncherPreferences.DEFAULT_PREF.edit().putString("defaultCtrl", path).apply();
++        git.artdeell.mojo.prefs.LauncherPreferences.PREF_DEFAULTCTRL_PATH = path;
++        String name = file.getName();
++        if(name.toLowerCase(java.util.Locale.ROOT).endsWith(".json")) name = name.substring(0, name.length() - 5);
++        Toast.makeText(requireContext(), "Controls: " + name, Toast.LENGTH_LONG).show();
++    }
+ }
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/instances/FrostDefaults.java b/app_mojo/src/main/java/git/artdeell/mojo/instances/FrostDefaults.java
+index ad9548f222f773d40f4acc4f07bc7d657abc5248..aa8bc23faa26c5c54ffd5d9c619815753f1e4437 100644
+--- a/app_mojo/src/main/java/git/artdeell/mojo/instances/FrostDefaults.java
++++ b/app_mojo/src/main/java/git/artdeell/mojo/instances/FrostDefaults.java
+@@ -44,7 +44,6 @@ final class FrostDefaults {
+         if (LauncherPreferences.DEFAULT_PREF != null) {
+             android.content.SharedPreferences.Editor editor = LauncherPreferences.DEFAULT_PREF.edit();
+             if (!LauncherPreferences.DEFAULT_PREF.contains("resolutionRatio")) editor.putInt("resolutionRatio", 70);
+-            if (!LauncherPreferences.DEFAULT_PREF.contains("sustainedPerformance")) editor.putBoolean("sustainedPerformance", true);
+             editor.apply();
+         }
+     }
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/instances/FrostSetup.java b/app_mojo/src/main/java/git/artdeell/mojo/instances/FrostSetup.java
+index e75fff6aa42feea611908c443585226b9b5a0e6e..7b89fd6744950ae97b993c08df766c26ece0f0d5 100644
+--- a/app_mojo/src/main/java/git/artdeell/mojo/instances/FrostSetup.java
++++ b/app_mojo/src/main/java/git/artdeell/mojo/instances/FrostSetup.java
+@@ -6,6 +6,9 @@ import android.util.Log;
+ import com.kdt.mcgui.ProgressLayout;
+ 
+ import git.artdeell.mojo.JVersionList;
++import git.artdeell.mojo.extra.ExtraConstants;
++import git.artdeell.mojo.extra.ExtraCore;
++import git.artdeell.mojo.tasks.AsyncVersionList;
+ import git.artdeell.mojo.LauncherActivity;
+ import git.artdeell.mojo.MojoApplication;
+ import git.artdeell.mojo.R;
+@@ -119,43 +122,90 @@ public final class FrostSetup {
+ 
+     // ---------------------------------------------------------------- setup
+ 
++    private static final int MAX_ATTEMPTS = 3;
++
+     public static void start(LauncherActivity activity, Instance instance) {
+         if (sRunning) return;
+         sRunning = true;
+         notifyListener();
+         final AssetManager assets = activity.getAssets();
+         ProgressLayout.setProgress(ProgressLayout.INSTANCE_INSTALL, 0);
+-        MojoApplication.sExecutorService.execute(() -> {
+-            try {
+-                String versionId = ensureForge(instance);
+-                ProgressLayout.clearProgress(ProgressLayout.INSTANCE_INSTALL);
+-                final String normalized = MoJsonExtras.normalizeVersionId(versionId);
+-                JVersionList.Version listed = MoJsonExtras.getListedVersion(normalized);
+-                new MoJsonDownloader().start(assets, listed, normalized, new MoJsonExtras.DoneListener() {
+-                    @Override
+-                    public void onDownloadDone(File[] classpath) {
+-                        try {
+-                            saveClasspath(normalized, classpath);
+-                        } catch (IOException e) {
+-                            Log.w(TAG, "Could not save the class path", e);
+-                        }
+-                        finish(null);
+-                    }
++        MojoApplication.sExecutorService.execute(() -> runSetup(assets, instance, 1));
++    }
+ 
+-                    @Override
+-                    public void onDownloadFailed(Throwable throwable) {
+-                        finish(throwable);
++    private static void runSetup(AssetManager assets, Instance instance, int attempt) {
++        try {
++            String versionId = ensureForge(instance);
++            ProgressLayout.clearProgress(ProgressLayout.INSTANCE_INSTALL);
++            // The list of Minecraft versions is fetched in the background when the launcher opens.
++            // Right after a fresh install it may not have arrived yet, so wait for it.
++            awaitVersionList();
++            final String normalized = MoJsonExtras.normalizeVersionId(versionId);
++            JVersionList.Version listed = MoJsonExtras.getListedVersion(normalized);
++            new MoJsonDownloader().start(assets, listed, normalized, new MoJsonExtras.DoneListener() {
++                @Override
++                public void onDownloadDone(File[] classpath) {
++                    try {
++                        saveClasspath(normalized, classpath);
++                    } catch (IOException e) {
++                        Log.w(TAG, "Could not save the class path", e);
+                     }
+-                });
+-            } catch (ForgeInstallerReader.Unsupported e) {
+-                ProgressLayout.clearProgress(ProgressLayout.INSTANCE_INSTALL);
+-                Log.w(TAG, "Falling back to the Forge installer window: " + e.getMessage());
+-                fallBackToInstaller(instance);
+-            } catch (Exception e) {
+-                ProgressLayout.clearProgress(ProgressLayout.INSTANCE_INSTALL);
+-                finish(e);
+-            }
++                    finish(null);
++                }
++
++                @Override
++                public void onDownloadFailed(Throwable throwable) {
++                    retryOrFinish(assets, instance, attempt, throwable);
++                }
++            });
++        } catch (ForgeInstallerReader.Unsupported e) {
++            ProgressLayout.clearProgress(ProgressLayout.INSTANCE_INSTALL);
++            Log.w(TAG, "Falling back to the Forge installer window: " + e.getMessage());
++            fallBackToInstaller(instance);
++        } catch (Exception e) {
++            ProgressLayout.clearProgress(ProgressLayout.INSTANCE_INSTALL);
++            retryOrFinish(assets, instance, attempt, e);
++        }
++    }
++
++    /** A first try can fail for passing reasons (a slow start, a dropped connection), so try again a couple of times. */
++    private static void retryOrFinish(AssetManager assets, Instance instance, int attempt, Throwable error) {
++        if (attempt >= MAX_ATTEMPTS) {
++            finish(error);
++            return;
++        }
++        Log.w(TAG, "Download attempt " + attempt + " failed, trying again", error);
++        try {
++            Thread.sleep(2000L * attempt);
++        } catch (InterruptedException e) {
++            finish(error);
++            return;
++        }
++        ProgressLayout.setProgress(ProgressLayout.INSTANCE_INSTALL, 0);
++        runSetup(assets, instance, attempt + 1);
++    }
++
++    /** Waits (up to about 40 seconds) until the Minecraft version list is available. */
++    private static void awaitVersionList() {
++        if (waitForVersionList(20000)) return;
++        // The first request did not succeed: ask again, then wait once more
++        new AsyncVersionList().getVersionList(versions -> {
++            if (versions != null) ExtraCore.setValue(ExtraConstants.RELEASE_TABLE, versions);
+         });
++        waitForVersionList(20000);
++    }
++
++    private static boolean waitForVersionList(long timeoutMs) {
++        long deadline = System.currentTimeMillis() + timeoutMs;
++        while (ExtraCore.getValue(ExtraConstants.RELEASE_TABLE) == null) {
++            if (System.currentTimeMillis() >= deadline) return false;
++            try {
++                Thread.sleep(250);
++            } catch (InterruptedException e) {
++                return false;
++            }
++        }
++        return true;
+     }
+ 
+     private static void finish(Throwable error) {
+diff --git a/app_mojo/src/main/java/git/artdeell/mojo/prefs/LauncherPreferences.java b/app_mojo/src/main/java/git/artdeell/mojo/prefs/LauncherPreferences.java
+index be24317a5096f917cd076440f861f06dd2788b81..b8d7f852a5bbfd710f16333129aa3f0f536936be 100644
+--- a/app_mojo/src/main/java/git/artdeell/mojo/prefs/LauncherPreferences.java
++++ b/app_mojo/src/main/java/git/artdeell/mojo/prefs/LauncherPreferences.java
+@@ -89,10 +89,10 @@ public class LauncherPreferences {
+ 		PREF_DEFAULTCTRL_PATH = DEFAULT_PREF.getString("defaultCtrl", Tools.CTRLDEF_FILE);
+         PREF_FORCE_ENGLISH = DEFAULT_PREF.getBoolean("force_english", false);
+         PREF_DISABLE_GESTURES = DEFAULT_PREF.getBoolean("disableGestures",false);
+-        PREF_DISABLE_SWAP_HAND = DEFAULT_PREF.getBoolean("disableDoubleTap", false);
++        PREF_DISABLE_SWAP_HAND = DEFAULT_PREF.getBoolean("disableDoubleTap", true);
+         PREF_RAM_ALLOCATION = DEFAULT_PREF.getInt("allocation", findBestRAMAllocation(ctx));
+         PREF_CUSTOM_JAVA_ARGS = DEFAULT_PREF.getString("javaArgs", "");
+-        PREF_SUSTAINED_PERFORMANCE = DEFAULT_PREF.getBoolean("sustainedPerformance", isDevicePowerful);
++        PREF_SUSTAINED_PERFORMANCE = DEFAULT_PREF.getBoolean("sustainedPerformance", false);
+         PREF_VIRTUAL_MOUSE_START = DEFAULT_PREF.getBoolean("mouse_start", false);
+         PREF_USE_ALTERNATE_SURFACE = DEFAULT_PREF.getBoolean("alternate_surface", isDevicePowerful);
+         PREF_JAVA_SANDBOX = DEFAULT_PREF.getBoolean("java_sandbox", true);
+diff --git a/app_mojo/src/main/res/layout-land/activity_mojo_ui.xml b/app_mojo/src/main/res/layout-land/activity_mojo_ui.xml
+index 0e5f48d7a6a0758da20a4b8ddac0587a197dcaac..2a60e340457e8a8b3352f0823c8fcfe2915db15a 100644
+--- a/app_mojo/src/main/res/layout-land/activity_mojo_ui.xml
++++ b/app_mojo/src/main/res/layout-land/activity_mojo_ui.xml
+@@ -17,6 +17,20 @@
+         app:layout_constraintTop_toTopOf="parent"
+         app:layout_constraintStart_toStartOf="parent"/>
+ 
++    <ImageButton
++        android:id="@+id/logs_button"
++        android:layout_width="@dimen/_52sdp"
++        android:layout_height="@dimen/_42sdp"
++        android:background="?attr/selectableItemBackground"
++        android:contentDescription="Logs"
++        android:paddingTop="@dimen/_8sdp"
++        android:paddingBottom="@dimen/_8sdp"
++        android:scaleType="fitCenter"
++        android:src="@drawable/ic_px_console"
++
++        app:layout_constraintEnd_toStartOf="@id/setting_button"
++        app:layout_constraintTop_toTopOf="parent" />
++
+     <ImageButton
+         android:id="@+id/setting_button"
+         android:layout_width="@dimen/_52sdp"
+diff --git a/app_mojo/src/main/res/layout-land/fragment_launcher.xml b/app_mojo/src/main/res/layout-land/fragment_launcher.xml
+index 4cc60f3ea42d2c5678a66572e93d0cc7cffdf44b..68f7928ec52bc9ba203c7fc41901ffb51988f5e8 100644
+--- a/app_mojo/src/main/res/layout-land/fragment_launcher.xml
++++ b/app_mojo/src/main/res/layout-land/fragment_launcher.xml
+@@ -202,49 +202,6 @@
+ 
+ 			</LinearLayout>
+ 
+-			<LinearLayout
+-			    android:layout_width="match_parent"
+-			    android:layout_height="wrap_content"
+-			    android:layout_marginTop="12dp"
+-			    android:orientation="horizontal">
+-
+-				<LinearLayout
+-				    android:id="@+id/share_logs_button"
+-				    android:layout_width="0dp"
+-				    android:layout_height="88dp"
+-				    android:layout_weight="1"
+-				    android:layout_marginStart="0dp"
+-				    android:layout_marginEnd="6dp"
+-				    android:background="@drawable/bg_home_card"
+-				    android:clickable="true"
+-				    android:focusable="true"
+-				    android:gravity="center"
+-				    android:orientation="vertical">
+-
+-				    <ImageView
+-				        android:layout_width="32dp"
+-				        android:layout_height="32dp"
+-				        android:importantForAccessibility="no"
+-				        android:src="@drawable/ic_px_sharelog"
+-				        android:tint="#91DFFB" />
+-
+-				    <TextView
+-				        android:layout_width="wrap_content"
+-				        android:layout_height="wrap_content"
+-				        android:layout_marginTop="6dp"
+-				        android:text="Logs"
+-				        android:textColor="#FFFFFF"
+-				        android:textSize="14sp"
+-				        android:textStyle="bold" />
+-				</LinearLayout>
+-
+-				<View
+-				    android:layout_width="0dp"
+-				    android:layout_height="1dp"
+-				    android:layout_weight="1"
+-				    android:layout_marginStart="6dp" />
+-
+-			</LinearLayout>
+ 		</LinearLayout>
+ 	</ScrollView>
+ 
+diff --git a/app_mojo/src/main/res/layout/activity_basemain.xml b/app_mojo/src/main/res/layout/activity_basemain.xml
+index f41645b8876e156273d4fd8b5b2c48b4dd49ad75..9cc86c853513dcf1ced9825f2e1cfea057f72fdc 100644
+--- a/app_mojo/src/main/res/layout/activity_basemain.xml
++++ b/app_mojo/src/main/res/layout/activity_basemain.xml
+@@ -90,6 +90,7 @@
+ 
+ 				<TextView
+ 					android:id="@+id/main_loading_screen_text"
++					android:visibility="gone"
+ 					android:layout_width="wrap_content"
+ 					android:layout_height="wrap_content"
+ 					android:text="@string/loading_screen_title"
+diff --git a/app_mojo/src/main/res/layout/activity_mojo_ui.xml b/app_mojo/src/main/res/layout/activity_mojo_ui.xml
+index 3835a03e09e93c505eb0f161769ad534418bbd2e..54164ced278f7f2aa75e27615a827ce59ecd8198 100644
+--- a/app_mojo/src/main/res/layout/activity_mojo_ui.xml
++++ b/app_mojo/src/main/res/layout/activity_mojo_ui.xml
+@@ -13,12 +13,26 @@
+ 
+         android:dropDownWidth="@dimen/_250sdp"
+         android:dropDownVerticalOffset="@dimen/_52sdp"
+-        android:paddingEnd="@dimen/_52sdp"
++        android:paddingEnd="@dimen/_104sdp"
+ 
+         app:layout_constraintTop_toTopOf="parent"
+         tools:ignore="RtlSymmetry" />
+     <!-- Ignore because it's  done to fit the ImageButton within spinner background -->
+ 
++    <ImageButton
++        android:id="@+id/logs_button"
++        android:layout_width="@dimen/_52sdp"
++        android:layout_height="@dimen/_52sdp"
++        android:background="?attr/selectableItemBackground"
++        android:contentDescription="Logs"
++        android:paddingTop="@dimen/_8sdp"
++        android:paddingBottom="@dimen/_8sdp"
++        android:scaleType="fitCenter"
++        android:src="@drawable/ic_px_console"
++
++        app:layout_constraintEnd_toStartOf="@id/setting_button"
++        app:layout_constraintTop_toTopOf="parent" />
++
+     <ImageButton
+         android:id="@+id/setting_button"
+         android:layout_width="@dimen/_52sdp"
+diff --git a/app_mojo/src/main/res/layout/fragment_launcher.xml b/app_mojo/src/main/res/layout/fragment_launcher.xml
+index 2014890554c39dadce1db213395229710db42772..0179bdf8a59ec55b117b26daafa0dddf329756da 100644
+--- a/app_mojo/src/main/res/layout/fragment_launcher.xml
++++ b/app_mojo/src/main/res/layout/fragment_launcher.xml
+@@ -183,49 +183,6 @@
+ 
+ 			</LinearLayout>
+ 
+-			<LinearLayout
+-			    android:layout_width="match_parent"
+-			    android:layout_height="wrap_content"
+-			    android:layout_marginTop="12dp"
+-			    android:orientation="horizontal">
+-
+-				<LinearLayout
+-				    android:id="@+id/share_logs_button"
+-				    android:layout_width="0dp"
+-				    android:layout_height="104dp"
+-				    android:layout_weight="1"
+-				    android:layout_marginStart="0dp"
+-				    android:layout_marginEnd="6dp"
+-				    android:background="@drawable/bg_home_card"
+-				    android:clickable="true"
+-				    android:focusable="true"
+-				    android:gravity="center"
+-				    android:orientation="vertical">
+-
+-				    <ImageView
+-				        android:layout_width="36dp"
+-				        android:layout_height="36dp"
+-				        android:importantForAccessibility="no"
+-				        android:src="@drawable/ic_px_sharelog"
+-				        android:tint="#91DFFB" />
+-
+-				    <TextView
+-				        android:layout_width="wrap_content"
+-				        android:layout_height="wrap_content"
+-				        android:layout_marginTop="8dp"
+-				        android:text="Logs"
+-				        android:textColor="#FFFFFF"
+-				        android:textSize="14sp"
+-				        android:textStyle="bold" />
+-				</LinearLayout>
+-
+-				<View
+-				    android:layout_width="0dp"
+-				    android:layout_height="1dp"
+-				    android:layout_weight="1"
+-				    android:layout_marginStart="6dp" />
+-
+-			</LinearLayout>
+ 		</LinearLayout>
+ 	</ScrollView>
+ 
+diff --git a/app_mojo/src/main/res/xml/pref_control.xml b/app_mojo/src/main/res/xml/pref_control.xml
+index 54587871707a8a81b45022398384ff5eaa525c5a..1c9016b634394c323ad428039d1c689320beab7b 100644
+--- a/app_mojo/src/main/res/xml/pref_control.xml
++++ b/app_mojo/src/main/res/xml/pref_control.xml
+@@ -23,7 +23,7 @@
+             android:title="@string/mcl_disable_gestures" />
+ 
+         <androidx.preference.SwitchPreferenceCompat
+-            android:defaultValue="false"
++            android:defaultValue="true"
+             android:key="disableDoubleTap"
+             android:summary="@string/mcl_disable_swap_hand_subtitle"
+             android:title="@string/mcl_disable_swap_hand"
